@@ -1,3 +1,9 @@
+# 自动提交代码到远程仓库
+
+`auto_commit.py` 是一个用于自动提交代码到远程仓库的脚本，并在提交成功或失败时发送邮件通知。
+
+## 使用方法
+```bash
 python auto_commit.py -h
 usage: 自动提交代码到远程仓库 [-h] [-r REPO] [-o ORIGIN] [-b BRANCH] [-t TIME] [-s SENDER_MAIL] [-p PWD] [-e RECEIVER_MAIL]
                    [-l LOG]
@@ -16,3 +22,4 @@ options:
   -e RECEIVER_MAIL, --receiver_mail RECEIVER_MAIL
                         收件人邮箱
   -l LOG, --log LOG     日志文件
+```
