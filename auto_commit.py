@@ -79,30 +79,57 @@ def subprocess_popen(command, work_dir=None, se_PIPE=True, so_PIPE=True):
     error_info = re.split(r'[\r\n]+', error.strip('\r\n'))
     return result, error_info, p.returncode
 
+class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    def _get_help_string(self, action):
+        help = action.help
+        if action.option_strings == ['-h', '--help']:
+            return help
+        help_default = ''
+        if action.default is not argparse.SUPPRESS and action.default is not None:
+            help_default = 'default: %(default)s'
+            action.required = True
+        help_required = '必须参数' if action.required else '可选参数'
+        if help_default:
+            help += f' ({help_required}, {help_default})'
+        else:
+            help += f' ({help_required})'
+        return help
+
+
 def get_arguments():
-    parser = argparse.ArgumentParser('自动提交代码到远程仓库')
+    parser = argparse.ArgumentParser(
+        description='自动定时提交代码到远程仓库并发送提示邮件',
+        # formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=CustomHelpFormatter
+    )
     # 仓库路径
-    parser.add_argument('-r', '--repo', help='仓库路径', default='/home/zhangff/beegfs/work/fiberseq/scripts')
+    parser.add_argument('-r', '--repo', help='本地git仓库路径', required=True)
     # 远程仓库标识
-    parser.add_argument('-o', '--origin', help='远程仓库标识', default='both')
+    parser.add_argument('-o', '--remote', help='远程仓库标识', required=True)
     # 远程仓库分支
-    parser.add_argument('-b', '--branch', help='远程仓库分支', default='main')
+    parser.add_argument('-b', '--branch', help='远程仓库分支', required=True)
     # 定时提交时间
-    parser.add_argument('-t', '--time', help='定时提交时间', default='23:30')
-    # 发件人邮箱
-    parser.add_argument('-s', '--sender_mail', help='发件人邮箱', default='1927466262@qq.com')
-    # 发件人邮箱授权码
-    parser.add_argument('-p', '--pwd', help='发件人邮箱授权码', default='oyznvtookrwybhgc')
+    parser.add_argument('-t', '--time', help='每日定时提交时间, 格式：HH:MM', default="23:30")
+    # # 发件人邮箱
+    # parser.add_argument('-s', '--sender_mail', help='发件人邮箱', default='1927466262@qq.com')
+    # # 发件人邮箱授权码
+    # parser.add_argument('-p', '--pwd', help='发件人邮箱授权码', default='oyznvtookrwybhgc')
     # 收件人邮箱
-    parser.add_argument('-e', '--receiver_mail', help='收件人邮箱')
+    parser.add_argument('-e', '--receiver_mail', help='收件人邮箱，不指定该参数则不发送邮件')
     # 日志文件
     parser.add_argument('-l', '--log', help='日志文件', default='auto_commit.log')
     args = parser.parse_args()
+    # 参数长度小于1时，输出帮助信息
+    if len(vars(args)) < 1:
+        parser.print_help()
+        exit(1)
     if not os.path.exists(args.repo):
         print(f"仓库路径不存在: {args.repo}")
         exit(1)
-
-    return args.repo, args.origin, args.branch, args.time, args.sender_mail, args.pwd, args.receiver_mail, args.log
+    sender_mail = '1927466262@qq.com'
+    pwd = 'oyznvtookrwybhgc'
+    return args.repo, args.remote, args.branch, args.time, sender_mail, pwd, args.receiver_mail, args.log
+    # return args.repo, args.remote, args.branch, args.time, args.sender_mail, args.pwd, args.receiver_mail, args.log
 
 
 # 检查是否全部文件都已经提交
@@ -184,7 +211,7 @@ def write_log(commit_status, log_file, log_info):
     flog.write(content)
     flog.close()
 
-def commit(repo_path, origin, branch):
+def commit(repo_path, remote, branch):
     """自动提交代码到远程仓库"""
     """运行命令并返回输出"""
     # 切换到 Git 仓库目录
@@ -193,12 +220,12 @@ def commit(repo_path, origin, branch):
         "git status",
         "git add -A",
         "git commit -m 'daily update'",
-        f"git push {origin} {branch}"
+        f"git push {remote} {branch}"
     ]   
     command_infos = [(command, *subprocess_popen(command)) for command in commands]
     return command_infos
 
-def auto_commit(repo_path, origin, branch, sender_mail, pwd, receiver_mail, log_file):
+def auto_commit(repo_path, remote, branch, sender_mail, pwd, receiver_mail, log_file):
     """自动提交代码到远程仓库"""
     # 检查是否有未提交的文件
     if all_files_committed(repo_path):
@@ -209,7 +236,7 @@ def auto_commit(repo_path, origin, branch, sender_mail, pwd, receiver_mail, log_
         log_info = status_info
     else:
         # 提交代码
-        commit_infos = commit(repo_path, origin, branch)
+        commit_infos = commit(repo_path, remote, branch)
         if receiver_mail:
             send_commit_mail(commit_infos, sender_mail, pwd, receiver_mail)
         commit_status = commit_infos[-1][-1]
@@ -218,8 +245,8 @@ def auto_commit(repo_path, origin, branch, sender_mail, pwd, receiver_mail, log_
     write_log(commit_status, log_file, log_info)
 
 def main():
-    repo_path, origin, branch, send_time, sender_mail, pwd, receiver_mail, log_file = get_arguments()
-    schedule.every().day.at(send_time).do(auto_commit, repo_path, origin, branch, sender_mail, pwd, receiver_mail, log_file)
+    repo_path, remote, branch, send_time, sender_mail, pwd, receiver_mail, log_file = get_arguments()
+    schedule.every().day.at(send_time).do(auto_commit, repo_path, remote, branch, sender_mail, pwd, receiver_mail, log_file)
     while True:
         schedule.run_pending()
         time.sleep(1)

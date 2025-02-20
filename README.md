@@ -4,22 +4,21 @@
 
 ## 使用方法
 ```bash
-python auto_commit.py -h
-usage: 自动提交代码到远程仓库 [-h] [-r REPO] [-o ORIGIN] [-b BRANCH] [-t TIME] [-s SENDER_MAIL] [-p PWD] [-e RECEIVER_MAIL]
-                   [-l LOG]
+usage: auto_commit.py [-h] -r REPO -o REMOTE -b BRANCH [-t TIME] [-e RECEIVER_MAIL] [-l LOG]
+
+自动定时提交代码到远程仓库并发送提示邮件
 
 options:
   -h, --help            show this help message and exit
-  -r REPO, --repo REPO  仓库路径
-  -o ORIGIN, --origin ORIGIN
-                        远程仓库标识
-  -b BRANCH, --branch BRANCH
-                        远程仓库分支
-  -t TIME, --time TIME  定时提交时间
-  -s SENDER_MAIL, --sender_mail SENDER_MAIL
-                        发件人邮箱
-  -p PWD, --pwd PWD     发件人邮箱授权码
-  -e RECEIVER_MAIL, --receiver_mail RECEIVER_MAIL
-                        收件人邮箱
-  -l LOG, --log LOG     日志文件
+  -r REPO, --repo REPO  本地git仓库路径 (必须参数)
+  -o REMOTE, --remote REMOTE  远程仓库标识 (必须参数)
+  -b BRANCH, --branch BRANCH  远程仓库分支 (必须参数)
+  -t TIME, --time TIME  每日定时提交时间, 格式：HH:MM (必须参数, default: 23:30)
+  -e RECEIVER_MAIL, --receiver_mail RECEIVER_MAIL   收件人邮箱，不指定该参数则不发送邮件 (可选参数)
+  -l LOG, --log LOG     日志文件 (必须参数, default: auto_commit.log)
+```
+
+## 示例
+```bash
+python auto_commit.py -r /path/to/repo -o origin -b main -t 23:30 -e receiver_email@example.com
 ```
