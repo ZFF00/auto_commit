@@ -1,6 +1,7 @@
 import os
 import argparse
 import subprocess
+import re
 import schedule
 import time
 from email.mime.text import MIMEText
@@ -109,7 +110,7 @@ def get_arguments():
     # 远程仓库分支
     parser.add_argument('-b', '--branch', help='远程仓库分支', required=True)
     # 定时提交时间
-    parser.add_argument('-t', '--time', help='每日定时提交时间, 格式：HH:MM', default="23:30")
+    parser.add_argument('-t', '--time', help='每日定时提交时间, 格式：HH:MM，多个时间用逗号分隔', default="23:30")
     # # 发件人邮箱
     # parser.add_argument('-s', '--sender_mail', help='发件人邮箱', default='1927466262@qq.com')
     # # 发件人邮箱授权码
@@ -126,9 +127,20 @@ def get_arguments():
     if not os.path.exists(args.repo):
         print(f"仓库路径不存在: {args.repo}")
         exit(1)
+    
+    # 解析时间参数，支持多个时间点
+    time_points = [t.strip() for t in args.time.split(',')]
+    
+    # 验证时间格式
+    time_pattern = re.compile(r'^([01]?\d|2[0-3]):([0-5]?\d)$')
+    for time_point in time_points:
+        if not time_pattern.match(time_point):
+            print(f"时间格式错误: {time_point}，请使用HH:MM格式")
+            exit(1)
+    
     sender_mail = '1927466262@qq.com'
     pwd = 'oyznvtookrwybhgc'
-    return args.repo, args.remote, args.branch, args.time, sender_mail, pwd, args.receiver_mail, args.log
+    return args.repo, args.remote, args.branch, time_points, sender_mail, pwd, args.receiver_mail, args.log
     # return args.repo, args.remote, args.branch, args.time, args.sender_mail, args.pwd, args.receiver_mail, args.log
 
 
@@ -140,26 +152,25 @@ def get_git_status(repo_path):
     result, error, returncode = subprocess_popen("git status")
     return result
 
-def all_files_committed(repo_path):
+def all_files_commited(repo_path):
     """检查是否有未提交的文件"""
     status = get_git_status(repo_path)
     status = '\n'.join(status)
     return "nothing to commit" in status
 
-def send_unchanged_mail(status_info, sender_mail, pwd, receiver_mail):
+def send_unchanged_mail(repo_name, status_info, sender_mail, pwd, receiver_mail):
     """发送未改动邮件"""
     status_info = '<br>'.join(status_info)
     mail_info = {
         "sender_mail": sender_mail,
         "pwd": pwd,
         "receiver_mail": receiver_mail,
-        "mail_title": "✅git仓库今日无改动",
+        "mail_title": f"✅git仓库今日无改动【{repo_name}】",
         "mail_content": f"<b style='color:green'>【git status】：</b><font style='color:black'><br/>{status_info}</font><br/>"
     }
     send_mail(mail_info)
 
-
-def send_commit_mail(commit_infos, sender_mail, pwd, receiver_mail):
+def send_commit_mail(repo_name, commit_infos, sender_mail, pwd, receiver_mail):
     """发送命令执行结果"""
     mail_info = {
         "sender_mail": sender_mail,
@@ -180,9 +191,9 @@ def send_commit_mail(commit_infos, sender_mail, pwd, receiver_mail):
             mail_info['mail_content'] += f"<br/><br/>"
     
     if returncode:
-        mail_info['mail_title'] = '❌️git仓库提交失败' 
+        mail_info['mail_title'] = f'❌️git仓库提交失败【{repo_name}】' 
     else:
-        mail_info['mail_title'] = '✅git仓库提交成功'
+        mail_info['mail_title'] = f'✅git仓库提交成功【{repo_name}】'
     send_mail(mail_info)
     return returncode
 
@@ -225,28 +236,59 @@ def commit(repo_path, remote, branch):
     command_infos = [(command, *subprocess_popen(command)) for command in commands]
     return command_infos
 
-def auto_commit(repo_path, remote, branch, sender_mail, pwd, receiver_mail, log_file):
+def auto_commit(repo_path, remote, branch, repo_name, sender_mail, pwd, receiver_mail, log_file):
     """自动提交代码到远程仓库"""
     # 检查是否有未提交的文件
-    if all_files_committed(repo_path):
+    if all_files_commited(repo_path):
         status_info = get_git_status(repo_path)
         if receiver_mail:
-            send_unchanged_mail(status_info, sender_mail, pwd, receiver_mail)
+            send_unchanged_mail(repo_name, status_info, sender_mail, pwd, receiver_mail)
         commit_status = -1
         log_info = status_info
     else:
         # 提交代码
         commit_infos = commit(repo_path, remote, branch)
         if receiver_mail:
-            send_commit_mail(commit_infos, sender_mail, pwd, receiver_mail)
+            send_commit_mail(repo_name, commit_infos, sender_mail, pwd, receiver_mail)
         commit_status = commit_infos[-1][-1]
         log_info = commit_infos
     # 写日志
     write_log(commit_status, log_file, log_info)
 
+def get_remote_info(repo_path, remote_name):
+    """获取远程仓库信息"""
+    os.chdir(repo_path)
+    
+    # 获取远程仓库URL
+    result, error, returncode = subprocess_popen(f"git remote get-url {remote_name}")
+    if returncode != 0:
+        return None, None
+
+    remote_url = result[0]
+    repo_name = remote_url.replace('git@github.com:', '').replace('.git', '')
+    return remote_url, repo_name
+
 def main():
-    repo_path, remote, branch, send_time, sender_mail, pwd, receiver_mail, log_file = get_arguments()
-    schedule.every().day.at(send_time).do(auto_commit, repo_path, remote, branch, sender_mail, pwd, receiver_mail, log_file)
+    repo_path, remote, branch, time_points, sender_mail, pwd, receiver_mail, log_file = get_arguments()
+    remote_url, repo_name = get_remote_info(repo_path, remote)
+    if not remote_url:
+        print(f"远程仓库标识 '{remote}' 未对应到任何远程仓库，请检查仓库路径和远程标识是否正确")
+        exit(1)
+    print(f"仓库路径: {repo_path}\n远程仓库: {remote_url}")
+
+    with open(log_file, 'w') as f:
+        f.write(f"########################### 自动提交日志 ###########################\n")
+        f.write(f"### 本地仓库: {repo_path}\n")
+        f.write(f"### 远程仓库: {remote_url}\n")
+        f.write(f"### 提交时间: {', '.join(time_points)}\n")
+        f.write(f"###################################################################\n\n")
+
+    # 为每个时间点创建定时任务
+    for time_point in time_points:
+        schedule.every().day.at(time_point).do(auto_commit, repo_path, remote, branch, repo_name, sender_mail, pwd, receiver_mail, log_file)
+        print(f"已设置定时任务: 每天 {time_point} 自动提交")
+    
+    print(f"共设置 {len(time_points)} 个定时任务")
     while True:
         schedule.run_pending()
         time.sleep(1)

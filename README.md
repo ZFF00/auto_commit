@@ -13,7 +13,7 @@ options:
   -r REPO, --repo REPO  本地git仓库路径 (必须参数)
   -o REMOTE, --remote REMOTE  远程仓库标识 (必须参数)
   -b BRANCH, --branch BRANCH  远程仓库分支 (必须参数)
-  -t TIME, --time TIME  每日定时提交时间, 格式：HH:MM (必须参数, default: 23:30)
+  -t, --time TIME       每日定时提交时间, 格式：HH:MM，多个时间用逗号分隔 (必须参数, default: 23:30)
   -e RECEIVER_MAIL, --receiver_mail RECEIVER_MAIL   收件人邮箱，不指定该参数则不发送邮件 (可选参数)
   -l LOG, --log LOG     日志文件 (必须参数, default: auto_commit.log)
 ```
@@ -21,4 +21,6 @@ options:
 ## 示例
 ```bash
 python auto_commit.py -r /path/to/repo -o origin -b main -t 23:30 -e receiver_email@example.com
+# 建议在后台运行，即：
+python auto_commit.py -r /path/to/repo -o origin -b main -t 23:30 -e receiver_email@example.com &
 ```
