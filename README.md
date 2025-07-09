@@ -56,19 +56,6 @@ options:
 | `--receiver_mail` | `-e` | string | ❌ | - | 接收通知的邮箱地址 |
 | `--log` | `-l` | string | ❌ | auto_commit.log | 日志文件路径 |
 
-## 配置邮件通知
-
-如需启用邮件通知功能，需要配置SMTP服务器信息。在脚本中修改以下配置：
-
-```python
-# 邮件配置（需要在脚本中设置）
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SENDER_EMAIL = "your_email@gmail.com"
-SENDER_PASSWORD = "your_app_password"
-```
-
-**注意**: 建议使用应用专用密码而非账户密码。
 
 ## 使用示例
 
