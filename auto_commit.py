@@ -4,6 +4,7 @@ import subprocess
 import re
 import schedule
 import time
+import datetime
 from email.mime.text import MIMEText
 from email.header import Header
 from smtplib import SMTP_SSL, SMTP
@@ -100,49 +101,56 @@ class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
 def get_arguments():
     parser = argparse.ArgumentParser(
         description='自动定时提交代码到远程仓库并发送提示邮件',
-        # formatter_class=argparse.ArgumentDefaultsHelpFormatter
         formatter_class=CustomHelpFormatter
     )
-    # 仓库路径
     parser.add_argument('-r', '--repo', help='本地git仓库路径', required=True)
-    # 远程仓库标识
     parser.add_argument('-o', '--remote', help='远程仓库标识', required=True)
-    # 远程仓库分支
     parser.add_argument('-b', '--branch', help='远程仓库分支', required=True)
-    # 定时提交时间
     parser.add_argument('-t', '--time', help='每日定时提交时间, 格式：HH:MM，多个时间用逗号分隔', default="23:30")
-    # # 发件人邮箱
-    # parser.add_argument('-s', '--sender_mail', help='发件人邮箱', default='1927466262@qq.com')
-    # # 发件人邮箱授权码
-    # parser.add_argument('-p', '--pwd', help='发件人邮箱授权码', default='oyznvtookrwybhgc')
-    # 收件人邮箱
     parser.add_argument('-e', '--receiver_mail', help='收件人邮箱，不指定该参数则不发送邮件')
-    # 日志文件
     parser.add_argument('-l', '--log', help='日志文件', default='auto_commit.log')
     args = parser.parse_args()
-    # 参数长度小于1时，输出帮助信息
     if len(vars(args)) < 1:
         parser.print_help()
         exit(1)
     if not os.path.exists(args.repo):
         print(f"仓库路径不存在: {args.repo}")
         exit(1)
-    
-    # 解析时间参数，支持多个时间点
     time_points = [t.strip() for t in args.time.split(',')]
-    
-    # 验证时间格式
     time_pattern = re.compile(r'^([01]?\d|2[0-3]):([0-5]?\d)$')
     for time_point in time_points:
         if not time_pattern.match(time_point):
             print(f"时间格式错误: {time_point}，请使用HH:MM格式")
             exit(1)
-    
     sender_mail = '1927466262@qq.com'
     pwd = 'oyznvtookrwybhgc'
     return args.repo, args.remote, args.branch, time_points, sender_mail, pwd, args.receiver_mail, args.log
-    # return args.repo, args.remote, args.branch, args.time, args.sender_mail, args.pwd, args.receiver_mail, args.log
 
+# 获取服务器时区与UTC的偏移（单位：小时）
+def get_timezone_offset():
+    if hasattr(time, "localtime") and hasattr(time.localtime(), "tm_gmtoff"):
+        offset_sec = time.localtime().tm_gmtoff
+        return offset_sec // 3600
+    try:
+        import subprocess
+        out = subprocess.check_output("date +%z", shell=True).decode().strip()
+        sign = 1 if out[0] == '+' else -1
+        hours = int(out[1:3])
+        return sign * hours
+    except Exception:
+        return 0
+
+# 将北京时间点转换为服务器本地时间点（字符串列表）
+def convert_beijing_time_to_local(beijing_times):
+    beijing_offset = 8
+    local_offset = get_timezone_offset()
+    delta = local_offset - beijing_offset
+    local_times = []
+    for t in beijing_times:
+        h, m = map(int, t.split(':'))
+        dt = datetime.datetime(2000, 1, 1, h, m) + datetime.timedelta(hours=delta)
+        local_times.append(dt.strftime('%H:%M'))
+    return local_times, delta
 
 # 检查是否全部文件都已经提交
 # git version 1.8.3.1
@@ -237,6 +245,7 @@ def commit(repo_path, remote, branch):
     return command_infos
 
 def auto_commit(repo_path, remote, branch, repo_name, sender_mail, pwd, receiver_mail, log_file):
+    print(' 时间到 ，开始自动提交代码...')
     """自动提交代码到远程仓库"""
     # 检查是否有未提交的文件
     if all_files_commited(repo_path):
@@ -269,26 +278,31 @@ def get_remote_info(repo_path, remote_name):
     return remote_url, repo_name
 
 def main():
-    repo_path, remote, branch, time_points, sender_mail, pwd, receiver_mail, log_file = get_arguments()
+    repo_path, remote, branch, beijing_times, sender_mail, pwd, receiver_mail, log_file = get_arguments()
     remote_url, repo_name = get_remote_info(repo_path, remote)
     if not remote_url:
         print(f"远程仓库标识 '{remote}' 未对应到任何远程仓库，请检查仓库路径和远程标识是否正确")
         exit(1)
     print(f"仓库路径: {repo_path}\n远程仓库: {remote_url}")
+    
+    local_times, delta = convert_beijing_time_to_local(beijing_times)
+    if delta == 0:
+        print("服务器时区为北京时间，无需转换。")
+    else:
+        print(f"服务器时区与北京时间相差 {delta} 小时。")
+        print(f"你输入的北京时间点: {', '.join(beijing_times)}")
+        print(f"将在服务器本地时间点: {', '.join(local_times)} 执行定时任务。")
 
     with open(log_file, 'w') as f:
         f.write(f"########################### 自动提交日志 ###########################\n")
         f.write(f"### 本地仓库: {repo_path}\n")
         f.write(f"### 远程仓库: {remote_url}\n")
-        f.write(f"### 提交时间: {', '.join(time_points)}\n")
+        f.write(f"### 提交时间: {', '.join(beijing_times)} (服务器本地时间: {', '.join(local_times)})\n")
         f.write(f"###################################################################\n\n")
-
-    # 为每个时间点创建定时任务
-    for time_point in time_points:
+    for time_point in local_times:
         schedule.every().day.at(time_point).do(auto_commit, repo_path, remote, branch, repo_name, sender_mail, pwd, receiver_mail, log_file)
-        print(f"已设置定时任务: 每天 {time_point} 自动提交")
-    
-    print(f"共设置 {len(time_points)} 个定时任务")
+        print(f"已设置定时任务: 每天 {time_point} (服务器本地时间) 自动提交")
+    print(f"共设置 {len(local_times)} 个定时任务")
     while True:
         schedule.run_pending()
         time.sleep(1)
