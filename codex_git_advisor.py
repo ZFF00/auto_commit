@@ -363,7 +363,7 @@ def redact_sensitive_output(text: str) -> str:
 
 def decode_bytes(data: bytes) -> str:
     encodings = list(
-        dict.fromkeys(["utf-8", locale.getpreferredencoding(False), "gb18030"])
+        dict.fromkeys(["utf-8", "gb18030", locale.getpreferredencoding(False)])
     )
     for encoding in encodings:
         try:

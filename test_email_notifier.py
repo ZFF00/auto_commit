@@ -60,7 +60,7 @@ class EmailMessageTests(unittest.TestCase):
         plain = message.get_body(preferencelist=("plain",)).get_content()
         rendered_html = message.get_body(preferencelist=("html",)).get_content()
         self.assertIn("0123456789abcdef", plain)
-        self.assertIn("本地仓库：C:\\work\\demo", plain)
+        self.assertIn(f"本地仓库：{Path('C:/work/demo')}", plain)
         self.assertIn("远程仓库：git@github.com:ZFF00/auto_commit.git", plain)
         self.assertIn("__pycache__/", rendered_html)
         self.assertIn("本地仓库", rendered_html)
