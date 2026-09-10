@@ -1,4 +1,7 @@
-# Added by auto_commit_v2.py
+# Generated files
 __pycache__/
 /auto_commit
 /nohup.out
+/build/
+/dist/
+/*.spec

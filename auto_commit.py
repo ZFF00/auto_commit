@@ -1,311 +1,846 @@
-import os
+#!/usr/bin/env python3
+"""Review, commit, and push Git repository changes with Codex."""
+
+from __future__ import annotations
+
 import argparse
+import datetime as dt
+import json
+import logging
+import os
 import subprocess
-import re
-import schedule
+import sys
+import tempfile
 import time
-import datetime
-from email.mime.text import MIMEText
-from email.header import Header
-from smtplib import SMTP_SSL, SMTP
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Sequence
 
-def send_mail(mail_info):
-    """
-
-    Parameters
-    ----------
-    mail_info : dict
-        sender_mail : str
-            发件人邮箱.
-        pwd : str
-            邮箱授权码.
-        receiver_mail : str
-            收件人邮箱.
-        mail_title : str
-            邮件标题.
-        mail_content : str
-            邮件正文内容.
-
-    Returns
-    -------
-    None.
-
-    """
-    mail = ["sender_mail", "pwd", "receiver_mail",
-            "mail_title", "mail_content"]
-    for key in mail:
-        if key in mail_info:
-            pass
-        else:
-            raise Exception("需要参数%s" % key)
-
-    # 解析参数
-    sender_mail = mail_info["sender_mail"]
-    pwd = mail_info["pwd"]
-    receiver_mail = mail_info["receiver_mail"]
-    mail_title = mail_info["mail_title"]
-    mail_content = mail_info["mail_content"]
-
-    # qq邮箱smtp服务器
-    host_server = 'smtp.qq.com'
-
-    smtp = SMTP_SSL(host_server)
-    # set_debuglevel()是用来调试的。参数值为1表示开启调试模式，参数值为0关闭调试模式
-    smtp.set_debuglevel(0)
-    smtp.ehlo(host_server)
-
-    smtp.login(sender_mail, pwd)
-
-    msg = MIMEText(mail_content, "html", 'utf-8')
-    msg["Subject"] = Header(mail_title, 'utf-8')
-    msg["From"] = Header('邮箱助手', 'utf-8')
-    msg["From"].append(f"<{sender_mail}>", 'ascii')
-    msg["To"] = receiver_mail
-    smtp.sendmail(sender_mail, receiver_mail, msg.as_string())
-    smtp.quit()
+import codex_git_advisor as advisor
+import email_notifier
 
 
-def subprocess_popen(command, work_dir=None, se_PIPE=True, so_PIPE=True):
-    # 执行系统命令
-    import os
-    import re
-    import subprocess
-    code = 'gbk' if os.name == 'nt' else 'utf-8'
-    so = subprocess.PIPE if so_PIPE else None   # 指定标准输出到哪
-    se = subprocess.PIPE if se_PIPE else None   # 指定标准错误输出到哪
-    p = subprocess.Popen(command, shell=True, stdout=so,
-                         stderr=se, cwd=work_dir)
-    data, error = p.communicate()    # communicate()等待子进程结束，从stdout和stderr读数据返回元组
-    data, error = ('' if i is None else i.decode(code) for i in (data, error))
-    result = re.split(r'[\r\n]+', data.strip('\r\n'))
-    error_info = re.split(r'[\r\n]+', error.strip('\r\n'))
-    return result, error_info, p.returncode
+VERSION = "3.0.0"
+LOGGER = logging.getLogger("auto_commit")
 
-class CustomHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
-    def _get_help_string(self, action):
-        help = action.help
-        if action.option_strings == ['-h', '--help']:
-            return help
-        help_default = ''
-        if action.default is not argparse.SUPPRESS and action.default is not None:
-            help_default = 'default: %(default)s'
-            action.required = True
-        help_required = '必须参数' if action.required else '可选参数'
-        if help_default:
-            help += f' ({help_required}, {help_default})'
-        else:
-            help += f' ({help_required})'
-        return help
+__all__ = [
+    "AutoCommitError",
+    "RunConfig",
+    "RunOutcome",
+    "execute_once",
+    "execute_and_notify",
+    "load_email_config",
+    "next_run_time",
+    "parse_schedule_times",
+    "run_scheduler",
+]
 
 
-def get_arguments():
-    parser = argparse.ArgumentParser(
-        description='自动定时提交代码到远程仓库并发送提示邮件',
-        formatter_class=CustomHelpFormatter
-    )
-    parser.add_argument('-r', '--repo', help='本地git仓库路径', required=True)
-    parser.add_argument('-o', '--remote', help='远程仓库标识', required=True)
-    parser.add_argument('-b', '--branch', help='远程仓库分支', required=True)
-    parser.add_argument('-t', '--time', help='每日定时提交时间, 格式：HH:MM，多个时间用逗号分隔', default="23:30")
-    parser.add_argument('-e', '--receiver_mail', help='收件人邮箱，不指定该参数则不发送邮件')
-    parser.add_argument('-l', '--log', help='日志文件', default='auto_commit.log')
-    args = parser.parse_args()
-    if len(vars(args)) < 1:
-        parser.print_help()
-        exit(1)
-    if not os.path.exists(args.repo):
-        print(f"仓库路径不存在: {args.repo}")
-        exit(1)
-    time_points = [t.strip() for t in args.time.split(',')]
-    time_pattern = re.compile(r'^([01]?\d|2[0-3]):([0-5]?\d)$')
-    for time_point in time_points:
-        if not time_pattern.match(time_point):
-            print(f"时间格式错误: {time_point}，请使用HH:MM格式")
-            exit(1)
-    sender_mail = '1927466262@qq.com'
-    pwd = 'oyznvtookrwybhgc'
-    return args.repo, args.remote, args.branch, time_points, sender_mail, pwd, args.receiver_mail, args.log
+class AutoCommitError(RuntimeError):
+    """An expected automation error that should be shown without a traceback."""
 
-# 获取服务器时区与UTC的偏移（单位：小时）
-def get_timezone_offset():
-    if hasattr(time, "localtime") and hasattr(time.localtime(), "tm_gmtoff"):
-        offset_sec = time.localtime().tm_gmtoff
-        return offset_sec // 3600
+
+@dataclass(frozen=True)
+class RunConfig:
+    repo: Path
+    remote: str = "origin"
+    branch: str | None = None
+    push: bool = True
+    dry_run: bool = False
+    codex_command: str = "codex"
+    model: str | None = None
+    timeout: int = 300
+    live: bool = False
+    language: str = "zh"
+
+
+@dataclass(frozen=True)
+class CommitPlan:
+    included_paths: tuple[str, ...]
+    excluded_paths: tuple[str, ...]
+    manual_review_paths: tuple[str, ...]
+    ignore_patterns: tuple[str, ...]
+    commit_message: str
+    cautions: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    repository: Path
+    branch: str
+    status: str
+    report: str
+    commit_hash: str = ""
+    pushed: bool = False
+    added_ignore_patterns: tuple[str, ...] = ()
+
+
+Analyzer = Callable[..., tuple[Path, dict[str, Any]]]
+EmailSender = Callable[
+    [email_notifier.EmailConfig, email_notifier.TaskNotification], bool
+]
+
+
+class RepositoryLock:
+    """Prevent two automation processes from committing the same repository."""
+
+    def __init__(self, repo: Path) -> None:
+        git_dir_result = run_git(repo, "rev-parse", "--git-dir")
+        git_dir = Path(git_dir_result.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = repo / git_dir
+        self.path = git_dir.resolve() / "auto_commit.lock"
+        self._acquired = False
+
+    def __enter__(self) -> RepositoryLock:
+        try:
+            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError as exc:
+            raise AutoCommitError(
+                f"另一个自动提交任务可能正在运行；锁文件仍存在：{self.path}"
+            ) from exc
+        with os.fdopen(descriptor, "w", encoding="ascii") as lock_file:
+            lock_file.write(f"pid={os.getpid()}\n")
+        self._acquired = True
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if self._acquired:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            self._acquired = False
+
+
+def run_git(
+    repo: Path,
+    *arguments: str,
+    input_text: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    command = ["git", *arguments]
     try:
-        import subprocess
-        out = subprocess.check_output("date +%z", shell=True).decode().strip()
-        sign = 1 if out[0] == '+' else -1
-        hours = int(out[1:3])
-        return sign * hours
-    except Exception:
-        return 0
-
-# 将北京时间点转换为服务器本地时间点（字符串列表）
-def convert_beijing_time_to_local(beijing_times):
-    beijing_offset = 8
-    local_offset = get_timezone_offset()
-    delta = local_offset - beijing_offset
-    local_times = []
-    for t in beijing_times:
-        h, m = map(int, t.split(':'))
-        dt = datetime.datetime(2000, 1, 1, h, m) + datetime.timedelta(hours=delta)
-        local_times.append(dt.strftime('%H:%M'))
-    return local_times, delta
-
-# 检查是否全部文件都已经提交
-# git version 1.8.3.1
-def get_git_status(repo_path):
-    """获取git仓库状态"""
-    os.chdir(repo_path)
-    result, error, returncode = subprocess_popen("git status")
+        result = subprocess.run(
+            command,
+            cwd=repo,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AutoCommitError("找不到 Git 命令") from exc
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "没有错误详情"
+        raise AutoCommitError(f"Git 命令失败：git {' '.join(arguments)}\n{detail}")
     return result
 
-def all_files_commited(repo_path):
-    """检查是否有未提交的文件"""
-    status = get_git_status(repo_path)
-    status = '\n'.join(status)
-    return "nothing to commit" in status
 
-def send_unchanged_mail(repo_name, status_info, sender_mail, pwd, receiver_mail):
-    """发送未改动邮件"""
-    status_info = '<br>'.join(status_info)
-    mail_info = {
-        "sender_mail": sender_mail,
-        "pwd": pwd,
-        "receiver_mail": receiver_mail,
-        "mail_title": f"✅git仓库今日无改动【{repo_name}】",
-        "mail_content": f"<b style='color:green'>【git status】：</b><font style='color:black'><br/>{status_info}</font><br/>"
+def _nul_paths(output: str) -> set[str]:
+    return {path.replace("\\", "/") for path in output.split("\0") if path}
+
+
+def list_changed_paths(repo: Path) -> set[str]:
+    """Return staged, unstaged, deleted, and untracked non-ignored paths."""
+    changed: set[str] = set()
+    for arguments in (
+        ("diff", "--name-only", "-z"),
+        ("diff", "--cached", "--name-only", "-z"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+    ):
+        changed.update(_nul_paths(run_git(repo, *arguments).stdout))
+    return changed
+
+
+def list_staged_paths(repo: Path) -> set[str]:
+    return _nul_paths(run_git(repo, "diff", "--cached", "--name-only", "-z").stdout)
+
+
+def stage_paths(repo: Path, paths: Sequence[str]) -> None:
+    if paths:
+        run_git(repo, "--literal-pathspecs", "add", "-A", "--", *paths)
+
+
+def current_branch(repo: Path, requested: str | None) -> str:
+    branch = requested
+    if branch is None:
+        result = run_git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+        if result.returncode != 0:
+            raise AutoCommitError("当前处于 detached HEAD；请使用 --branch 指定推送分支")
+        branch = result.stdout.strip()
+    validation = run_git(repo, "check-ref-format", "--branch", branch, check=False)
+    if validation.returncode != 0:
+        raise AutoCommitError(f"无效的分支名称：{branch}")
+    return branch
+
+
+def ensure_preconditions(repo: Path, *, remote: str, push: bool) -> None:
+    run_git(repo, "var", "GIT_AUTHOR_IDENT")
+    if push:
+        if not remote or remote.startswith("-") or any(char.isspace() for char in remote):
+            raise AutoCommitError(f"无效的 Git 远程仓库名：{remote!r}")
+        remotes = set(run_git(repo, "remote").stdout.splitlines())
+        if remote not in remotes:
+            raise AutoCommitError(f"找不到 Git 远程仓库：{remote}")
+
+
+def normalize_repo_path(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.parts[0].endswith(":")
+        or "\0" in normalized
+        or "\n" in normalized
+        or "\r" in normalized
+    ):
+        raise AutoCommitError(f"Codex 返回了不安全的仓库路径：{value!r}")
+    return path.as_posix()
+
+
+def validate_ignore_pattern(value: str) -> str:
+    pattern = value.strip().replace("\\", "/")
+    broad_patterns = {"*", "**", "/*", "/**", "**/*", "*.*", "/**/*"}
+    if (
+        not pattern
+        or pattern in broad_patterns
+        or pattern.startswith("!")
+        or "\0" in pattern
+        or "\n" in pattern
+        or "\r" in pattern
+        or ".." in PurePosixPath(pattern.lstrip("/")).parts
+    ):
+        raise AutoCommitError(f"Codex 返回了不安全或过宽的 .gitignore 规则：{value!r}")
+    return pattern
+
+
+def _path_tuple(values: Any, field: str) -> tuple[str, ...]:
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        raise AutoCommitError(f"Codex 结果中的 {field} 不是字符串列表")
+    normalized = tuple(normalize_repo_path(item) for item in values)
+    if len(normalized) != len(set(normalized)):
+        raise AutoCommitError(f"Codex 结果中的 {field} 含有重复路径")
+    return normalized
+
+
+def validate_plan(result: dict[str, Any], changed_paths: set[str]) -> CommitPlan:
+    if result.get("clean") is not False:
+        raise AutoCommitError("工作区存在改动，但 Codex 错误地返回 clean=true")
+    commit = result.get("commit")
+    if not isinstance(commit, dict):
+        raise AutoCommitError("Codex 结果缺少 commit 对象")
+
+    included = _path_tuple(commit.get("included_paths"), "included_paths")
+    excluded = _path_tuple(commit.get("excluded_paths"), "excluded_paths")
+    manual = _path_tuple(commit.get("manual_review_paths"), "manual_review_paths")
+    groups = [set(included), set(excluded), set(manual)]
+    if groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2]:
+        raise AutoCommitError("Codex 返回的包含、排除和人工确认路径发生重叠")
+
+    classified = groups[0] | groups[1] | groups[2]
+    if classified != changed_paths:
+        missing = sorted(changed_paths - classified)
+        extra = sorted(classified - changed_paths)
+        details = []
+        if missing:
+            details.append(f"未分类：{', '.join(missing)}")
+        if extra:
+            details.append(f"不存在的分类：{', '.join(extra)}")
+        raise AutoCommitError("Codex 没有准确覆盖当前改动；" + "；".join(details))
+
+    recommendations = result.get("ignore_recommendations")
+    if not isinstance(recommendations, list):
+        raise AutoCommitError("Codex 结果中的 ignore_recommendations 不是列表")
+    recommendation_paths: set[str] = set()
+    patterns: list[str] = []
+    for item in recommendations:
+        if not isinstance(item, dict):
+            raise AutoCommitError("Codex 返回了无效的忽略建议")
+        path = normalize_repo_path(str(item.get("path", "")))
+        if path not in groups[1]:
+            raise AutoCommitError(f"忽略建议路径未被归入 excluded_paths：{path}")
+        if item.get("confidence") != "high":
+            raise AutoCommitError(f"自动忽略只接受 high 置信度：{path}")
+        if item.get("tracked") is not False:
+            raise AutoCommitError(f"不能自动忽略已跟踪或状态不明的路径：{path}")
+        recommendation_paths.add(path)
+        pattern = validate_ignore_pattern(str(item.get("gitignore_pattern", "")))
+        if pattern not in patterns:
+            patterns.append(pattern)
+    if recommendation_paths != groups[1]:
+        raise AutoCommitError("excluded_paths 与 ignore_recommendations 不一致")
+
+    cautions_value = result.get("cautions")
+    if not isinstance(cautions_value, list):
+        raise AutoCommitError("Codex 结果中的 cautions 不是对象列表")
+    cautions_list: list[dict[str, Any]] = []
+    for item in cautions_value:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("reason"), str)
+            or not isinstance(item.get("blocking"), bool)
+        ):
+            raise AutoCommitError("Codex 返回了格式无效的风险提示")
+        cautions_list.append(item)
+    cautions = tuple(cautions_list)
+
+    message = commit.get("full_message")
+    if not isinstance(message, str):
+        raise AutoCommitError("Codex 结果中的 full_message 不是字符串")
+    message = message.strip()
+    if (included or patterns) and not message:
+        raise AutoCommitError("Codex 没有生成 commit message")
+    if "\0" in message or len(message) > 20_000:
+        raise AutoCommitError("Codex 返回的 commit message 无效或过长")
+    if advisor.redact_sensitive_output(message) != message:
+        raise AutoCommitError("Codex 返回的 commit message 疑似包含凭据，已停止")
+
+    return CommitPlan(included, excluded, manual, tuple(patterns), message, cautions)
+
+
+def validate_ignore_matches(
+    patterns: Sequence[str],
+    *,
+    excluded_paths: Sequence[str],
+    protected_paths: Sequence[str],
+) -> None:
+    """Use Git itself to ensure suggested rules cover only the intended changed paths."""
+    if not patterns:
+        return
+    with tempfile.TemporaryDirectory(prefix="auto_commit_ignore_check_") as directory:
+        temp_repo = Path(directory)
+        run_git(temp_repo, "init", "--quiet")
+        (temp_repo / ".gitignore").write_text(
+            "\n".join(patterns) + "\n", encoding="utf-8", newline="\n"
+        )
+        candidates = [*excluded_paths, *protected_paths]
+        input_text = "\0".join(candidates) + "\0"
+        result = run_git(
+            temp_repo,
+            "check-ignore",
+            "--no-index",
+            "-z",
+            "--stdin",
+            input_text=input_text,
+            check=False,
+        )
+        if result.returncode not in (0, 1):
+            detail = result.stderr.strip() or "无法验证规则"
+            raise AutoCommitError(f".gitignore 规则验证失败：{detail}")
+        matched = _nul_paths(result.stdout)
+    uncovered = set(excluded_paths) - matched
+    affected = set(protected_paths) & matched
+    if uncovered:
+        raise AutoCommitError(
+            ".gitignore 规则没有覆盖建议排除路径：" + ", ".join(sorted(uncovered))
+        )
+    if affected:
+        raise AutoCommitError(
+            ".gitignore 规则会误伤应提交或人工确认的路径："
+            + ", ".join(sorted(affected))
+        )
+
+
+def update_gitignore(repo: Path, patterns: Sequence[str]) -> tuple[str, ...]:
+    if not patterns:
+        return ()
+    path = repo / ".gitignore"
+    existing = path.read_text(encoding="utf-8-sig") if path.exists() else ""
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    additions = tuple(pattern for pattern in patterns if pattern not in existing_lines)
+    if not additions:
+        return ()
+    prefix = existing
+    if prefix and not prefix.endswith(("\n", "\r")):
+        prefix += "\n"
+    if prefix and prefix.strip():
+        prefix += "\n"
+    content = prefix + "# Added by auto_commit.py\n" + "\n".join(additions) + "\n"
+    path.write_text(content, encoding="utf-8", newline="\n")
+    return additions
+
+
+def has_head(repo: Path) -> bool:
+    return run_git(repo, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
+
+
+def push_head(repo: Path, remote: str, branch: str) -> bool:
+    if not has_head(repo):
+        return False
+    run_git(repo, "push", "--porcelain", "--", remote, f"HEAD:refs/heads/{branch}")
+    return True
+
+
+def execute_once(config: RunConfig, *, analyzer: Analyzer | None = None) -> RunOutcome:
+    """Analyze and perform one complete local commit/push cycle."""
+    repo = advisor.find_repository(config.repo)
+    branch = current_branch(repo, config.branch)
+    if not config.dry_run:
+        ensure_preconditions(repo, remote=config.remote, push=config.push)
+    analyze = analyzer or advisor.analyze_repository
+
+    with RepositoryLock(repo):
+        changed_paths = list_changed_paths(repo)
+        if not changed_paths:
+            pushed = False
+            if config.push and not config.dry_run:
+                pushed = push_head(repo, config.remote, branch)
+            status = "dry-run" if config.dry_run else "clean"
+            report = f"仓库：{repo}\n分支：{branch}\n摘要：工作区没有待提交改动。"
+            return RunOutcome(repo, branch, status, report, pushed=pushed)
+
+        analyzed_repo, result = analyze(
+            repo,
+            codex_command=config.codex_command,
+            model=config.model,
+            timeout=config.timeout,
+            live=config.live,
+            language=config.language,
+        )
+        if analyzed_repo.resolve() != repo.resolve():
+            raise AutoCommitError("Codex 分析结果来自另一个仓库")
+        report = advisor.render_report(repo, result)
+        plan = validate_plan(result, changed_paths)
+
+        validate_ignore_matches(
+            plan.ignore_patterns,
+            excluded_paths=plan.excluded_paths,
+            protected_paths=(*plan.included_paths, *plan.manual_review_paths),
+        )
+        staged_before = list_staged_paths(repo)
+        unsafe_staged = staged_before & (set(plan.excluded_paths) | set(plan.manual_review_paths))
+        if unsafe_staged:
+            raise AutoCommitError(
+                "建议排除或人工确认的文件已经暂存，已停止："
+                + ", ".join(sorted(unsafe_staged))
+            )
+        if config.dry_run:
+            return RunOutcome(repo, branch, "dry-run", report)
+
+        if plan.manual_review_paths:
+            raise AutoCommitError(
+                "存在需人工确认的文件，已停止自动提交："
+                + ", ".join(plan.manual_review_paths)
+            )
+        blocking = [
+            advisor.redact_sensitive_output(str(item.get("reason", "未知风险")))
+            for item in plan.cautions
+            if item.get("blocking") is True
+        ]
+        if blocking:
+            raise AutoCommitError("存在阻断风险，已停止自动提交：" + "；".join(blocking))
+
+        if list_changed_paths(repo) != changed_paths:
+            raise AutoCommitError("Codex 分析期间仓库内容发生变化，请重新执行")
+
+        added_patterns = update_gitignore(repo, plan.ignore_patterns)
+        paths_to_stage = list(plan.included_paths)
+        if added_patterns and ".gitignore" not in paths_to_stage:
+            paths_to_stage.append(".gitignore")
+        stage_paths(repo, paths_to_stage)
+
+        staged_after = list_staged_paths(repo)
+        allowed_staged = set(paths_to_stage)
+        unexpected_staged = staged_after - allowed_staged
+        if unexpected_staged:
+            raise AutoCommitError(
+                "暂存区出现未经 Codex 批准的文件，已停止提交："
+                + ", ".join(sorted(unexpected_staged))
+            )
+        if not staged_after:
+            pushed = push_head(repo, config.remote, branch) if config.push else False
+            return RunOutcome(
+                repo,
+                branch,
+                "clean",
+                report,
+                pushed=pushed,
+                added_ignore_patterns=added_patterns,
+            )
+
+        run_git(repo, "commit", "--file=-", input_text=plan.commit_message + "\n")
+        commit_hash = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        pushed = push_head(repo, config.remote, branch) if config.push else False
+        return RunOutcome(
+            repo,
+            branch,
+            "committed",
+            report,
+            commit_hash=commit_hash,
+            pushed=pushed,
+            added_ignore_patterns=added_patterns,
+        )
+
+
+def parse_schedule_times(values: Sequence[str]) -> tuple[dt.time, ...]:
+    parsed: set[dt.time] = set()
+    for value in values:
+        for item in value.split(","):
+            candidate = item.strip()
+            try:
+                parsed.add(dt.datetime.strptime(candidate, "%H:%M").time())
+            except ValueError as exc:
+                raise AutoCommitError(f"无效的执行时间：{candidate}，应为 HH:MM") from exc
+    if not parsed:
+        raise AutoCommitError("至少需要一个执行时间")
+    return tuple(sorted(parsed))
+
+
+def next_run_time(now: dt.datetime, schedule: Sequence[dt.time]) -> dt.datetime:
+    candidates = [dt.datetime.combine(now.date(), item) for item in schedule]
+    future = [candidate for candidate in candidates if candidate > now]
+    if future:
+        return min(future)
+    return min(candidates) + dt.timedelta(days=1)
+
+
+def format_outcome(outcome: RunOutcome) -> str:
+    lines = [outcome.report]
+    if outcome.added_ignore_patterns:
+        lines.extend(
+            [
+                "",
+                "已写入 .gitignore：",
+                *[f"- {pattern}" for pattern in outcome.added_ignore_patterns],
+            ]
+        )
+    if outcome.commit_hash:
+        lines.extend(["", f"本地提交：{outcome.commit_hash}"])
+    if outcome.pushed:
+        lines.append(f"已推送到：{outcome.branch}")
+    elif outcome.status == "dry-run":
+        lines.extend(["", "演练模式：未修改文件、未提交、未推送。"])
+    elif outcome.status == "clean":
+        lines.extend(["", "没有新的可提交改动。"])
+    return "\n".join(lines).rstrip()
+
+
+def _default_smtp_settings(sender: str) -> tuple[str, int, str] | None:
+    domain = sender.rpartition("@")[2].lower()
+    known = {
+        "qq.com": ("smtp.qq.com", 465, "ssl"),
+        "163.com": ("smtp.163.com", 465, "ssl"),
+        "126.com": ("smtp.126.com", 465, "ssl"),
+        "gmail.com": ("smtp.gmail.com", 465, "ssl"),
+        "outlook.com": ("smtp.office365.com", 587, "starttls"),
+        "hotmail.com": ("smtp.office365.com", 587, "starttls"),
+        "live.com": ("smtp.office365.com", 587, "starttls"),
     }
-    send_mail(mail_info)
+    return known.get(domain)
 
-def send_commit_mail(repo_name, commit_infos, sender_mail, pwd, receiver_mail):
-    """发送命令执行结果"""
-    mail_info = {
-        "sender_mail": sender_mail,
-        "pwd": pwd,
-        "receiver_mail": receiver_mail,
-        "mail_title": "命令执行结果",
-        "mail_content": ""
-    }
-    for command, success, error, returncode in commit_infos:
-        success_info = '<br/>'.join(success)
-        error_info = '<br/>'.join(error)
-        mail_info['mail_content'] += f"<b style='color:green'>【{command}】：</b><br/>"
-        if error_info:
-            mail_info['mail_content'] += f"<font style='color:black'>{error_info}</font><br/><br/>"
-        if success_info:
-            mail_info['mail_content'] += f"<font style='color:black'>{success_info}</font><br/><br/>"
-        if not success_info and not error_info:
-            mail_info['mail_content'] += f"<br/><br/>"
-    
-    if returncode:
-        mail_info['mail_title'] = f'❌️git仓库提交失败【{repo_name}】' 
-    else:
-        mail_info['mail_title'] = f'✅git仓库提交成功【{repo_name}】'
-    send_mail(mail_info)
-    return returncode
 
-def write_log(commit_status, log_file, log_info):
-    # commit: -1未提交，0提交成功，>1提交失败
-    # 如果未提交，log_info为git status，否则为命令执行结果
-    content = f"【{time.strftime('%Y-%m-%d %H:%M:%S')}】 "
-    if commit_status == -1:
-        content += f"（无改动）：\n"
+def load_email_config(
+    environment: dict[str, str] | None = None,
+    *,
+    required: bool = False,
+    sender: str | None = None,
+    auth_code: str | None = None,
+    recipients: str | None = None,
+) -> email_notifier.EmailConfig | None:
+    """Load email settings, preferring explicit values over the environment."""
+    values = os.environ if environment is None else environment
+    resolved_sender = (
+        sender if sender is not None else values.get("MAIL_SENDER", "")
+    ).strip()
+    resolved_auth_code = (
+        auth_code if auth_code is not None else values.get("MAIL_AUTH_CODE", "")
+    ).strip()
+    recipient_value = (
+        recipients if recipients is not None else values.get("MAIL_RECIPIENTS", "")
+    ).strip()
+    core_present = any((resolved_sender, resolved_auth_code, recipient_value))
+    if not core_present and not required:
+        return None
 
-    elif commit_status == 0:
-        content += f"（提交成功）：\n"
-    else:
-        content += f"（提交失败）：\n"
-    """写日志"""
-    flog = open(log_file, 'a')
-    if commit_status == -1:
-        content += '-' * 30 + 'git status' + '-' * 30 + '\n'
-        content += '\n'.join(log_info)
-    else:
-        for command, success, error, returncode in log_info:
-            content += f"{'-' * 30} {command} {'-' * 30}\n"
-            content += '\n'.join(success) + '\n'
-            content += '\n'.join(error) + '\n'
-    content += '\n\n\n'
-    flog.write(content)
-    flog.close()
+    missing = [
+        name
+        for name, value in (
+            ("MAIL_SENDER/--mail-sender", resolved_sender),
+            ("MAIL_AUTH_CODE/--mail-auth-code", resolved_auth_code),
+            ("MAIL_RECIPIENTS/--mail-recipients", recipient_value),
+        )
+        if not value
+    ]
+    if missing:
+        raise AutoCommitError("邮件配置不完整，缺少环境变量：" + ", ".join(missing))
 
-def commit(repo_path, remote, branch):
-    """自动提交代码到远程仓库"""
-    """运行命令并返回输出"""
-    # 切换到 Git 仓库目录
-    os.chdir(repo_path)
-    commands = [
-        "git status",
-        "git add -A",
-        "git commit -m 'daily update'",
-        f"git push {remote} {branch}"
-    ]   
-    command_infos = [(command, *subprocess_popen(command)) for command in commands]
-    return command_infos
+    recipients = tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in recipient_value.replace(";", ",").split(",")
+            if item.strip()
+        )
+    )
+    inferred = _default_smtp_settings(resolved_sender)
+    host = values.get("MAIL_SMTP_HOST", "").strip()
+    if not host:
+        if inferred is None:
+            raise AutoCommitError(
+                "无法根据发件邮箱推断 SMTP 服务器，请设置 MAIL_SMTP_HOST"
+            )
+        host = inferred[0]
+    security = values.get(
+        "MAIL_SMTP_SECURITY", inferred[2] if inferred else "ssl"
+    ).strip().lower()
+    default_port = inferred[1] if inferred and security == inferred[2] else (
+        587 if security == "starttls" else 465
+    )
+    try:
+        port = int(values.get("MAIL_SMTP_PORT", str(default_port)))
+    except ValueError as exc:
+        raise AutoCommitError("MAIL_SMTP_PORT 必须是整数") from exc
 
-def auto_commit(repo_path, remote, branch, repo_name, sender_mail, pwd, receiver_mail, log_file):
-    print(' 时间到 ，开始自动提交代码...')
-    """自动提交代码到远程仓库"""
-    # 检查是否有未提交的文件
-    if all_files_commited(repo_path):
-        status_info = get_git_status(repo_path)
-        if receiver_mail:
-            send_unchanged_mail(repo_name, status_info, sender_mail, pwd, receiver_mail)
-        commit_status = -1
-        log_info = status_info
-    else:
-        # 提交代码
-        commit_infos = commit(repo_path, remote, branch)
-        if receiver_mail:
-            send_commit_mail(repo_name, commit_infos, sender_mail, pwd, receiver_mail)
-        commit_status = commit_infos[-1][-1]
-        log_info = commit_infos
-    # 写日志
-    write_log(commit_status, log_file, log_info)
+    config = email_notifier.EmailConfig(
+        recipients=recipients,
+        host=host,
+        port=port,
+        username=resolved_sender,
+        password=resolved_auth_code,
+        security=security,  # type: ignore[arg-type]
+        sender=resolved_sender,
+        sender_name="Codex Git 推送",
+        policy="always",
+        timeout=30,
+    )
+    try:
+        config.validate()
+    except email_notifier.EmailNotificationError as exc:
+        raise AutoCommitError(str(exc)) from exc
+    return config
 
-def get_remote_info(repo_path, remote_name):
-    """获取远程仓库信息"""
-    os.chdir(repo_path)
-    
-    # 获取远程仓库URL
-    result, error, returncode = subprocess_popen(f"git remote get-url {remote_name}")
-    if returncode != 0:
-        return None, None
 
-    remote_url = result[0]
-    repo_name = remote_url.replace('git@github.com:', '').replace('.git', '')
-    return remote_url, repo_name
+def _remote_repository(repo: Path, remote: str) -> str:
+    """Return the raw configured URL without applying Git URL rewrite rules."""
+    try:
+        return run_git(repo, "config", "--get", f"remote.{remote}.url").stdout.strip()
+    except AutoCommitError:
+        return ""
 
-def main():
-    repo_path, remote, branch, beijing_times, sender_mail, pwd, receiver_mail, log_file = get_arguments()
-    remote_url, repo_name = get_remote_info(repo_path, remote)
-    if not remote_url:
-        print(f"远程仓库标识 '{remote}' 未对应到任何远程仓库，请检查仓库路径和远程标识是否正确")
-        exit(1)
-    print(f"仓库路径: {repo_path}\n远程仓库: {remote_url}")
-    
-    local_times, delta = convert_beijing_time_to_local(beijing_times)
-    if delta == 0:
-        print("服务器时区为北京时间，无需转换。")
-    else:
-        print(f"服务器时区与北京时间相差 {delta} 小时。")
-        print(f"你输入的北京时间点: {', '.join(beijing_times)}")
-        print(f"将在服务器本地时间点: {', '.join(local_times)} 执行定时任务。")
 
-    with open(log_file, 'w') as f:
-        f.write(f"########################### 自动提交日志 ###########################\n")
-        f.write(f"### 本地仓库: {repo_path}\n")
-        f.write(f"### 远程仓库: {remote_url}\n")
-        f.write(f"### 提交时间: {', '.join(beijing_times)} (服务器本地时间: {', '.join(local_times)})\n")
-        f.write(f"###################################################################\n\n")
-    for time_point in local_times:
-        schedule.every().day.at(time_point).do(auto_commit, repo_path, remote, branch, repo_name, sender_mail, pwd, receiver_mail, log_file)
-        print(f"已设置定时任务: 每天 {time_point} (服务器本地时间) 自动提交")
-    print(f"共设置 {len(local_times)} 个定时任务")
+def _outcome_notification(
+    outcome: RunOutcome, remote: str
+) -> email_notifier.TaskNotification:
+    return email_notifier.TaskNotification(
+        success=True,
+        status=outcome.status,
+        repository=outcome.repository,
+        branch=outcome.branch,
+        occurred_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        summary=advisor.redact_sensitive_output(format_outcome(outcome)),
+        remote_repository=_remote_repository(outcome.repository, remote),
+        commit_hash=outcome.commit_hash,
+        pushed=outcome.pushed,
+        ignore_patterns=outcome.added_ignore_patterns,
+    )
+
+
+def _failure_notification(
+    config: RunConfig, error: Exception
+) -> email_notifier.TaskNotification:
+    return email_notifier.TaskNotification(
+        success=False,
+        status="failed",
+        repository=config.repo.expanduser().resolve(),
+        branch=config.branch or "未知",
+        occurred_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        summary=advisor.redact_sensitive_output(str(error)),
+        remote_repository=_remote_repository(
+            config.repo.expanduser().resolve(), config.remote
+        ),
+    )
+
+
+def execute_and_notify(
+    config: RunConfig,
+    email_config: email_notifier.EmailConfig | None,
+    *,
+    analyzer: Analyzer | None = None,
+    email_sender: EmailSender = email_notifier.send_notification,
+) -> RunOutcome:
+    """Execute one task and send a success or failure notification."""
+    try:
+        outcome = execute_once(config, analyzer=analyzer)
+    except Exception as task_error:
+        if email_config is not None:
+            try:
+                email_sender(email_config, _failure_notification(config, task_error))
+            except email_notifier.EmailNotificationError as mail_error:
+                raise AutoCommitError(
+                    f"{task_error}\n另外，失败通知也未能发送：{mail_error}"
+                ) from task_error
+        raise
+
+    if email_config is not None:
+        try:
+            email_sender(email_config, _outcome_notification(outcome, config.remote))
+        except email_notifier.EmailNotificationError as exc:
+            raise AutoCommitError(
+                f"Git 任务已经完成，但邮件通知失败：{exc}"
+            ) from exc
+    return outcome
+
+
+def run_scheduler(
+    config: RunConfig,
+    schedule: Sequence[dt.time],
+    *,
+    email_config: email_notifier.EmailConfig | None = None,
+    run_now: bool = False,
+    clock: Callable[[], dt.datetime] = dt.datetime.now,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> None:
+    def run_task() -> None:
+        started = clock().astimezone().isoformat(timespec="seconds")
+        LOGGER.info("开始自动提交任务：%s", started)
+        try:
+            outcome = execute_and_notify(config, email_config)
+        except Exception as exc:
+            LOGGER.error("自动提交任务失败：%s", exc)
+        else:
+            print(format_outcome(outcome), flush=True)
+            LOGGER.info("自动提交任务完成：%s", outcome.status)
+
+    if run_now:
+        run_task()
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        now = clock()
+        next_run = next_run_time(now, schedule)
+        delay = max(0.0, (next_run - now).total_seconds())
+        LOGGER.info("下次执行时间：%s", next_run.astimezone().isoformat(timespec="minutes"))
+        sleeper(delay)
+        run_task()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="调用本机 Codex 审查改动，自动更新 .gitignore、提交并推送。"
+    )
+    parser.add_argument("-r", "--repo", type=Path, default=Path.cwd(), help="Git 仓库路径")
+    parser.add_argument("--once", action="store_true", help="立即执行一次后退出")
+    parser.add_argument(
+        "-t",
+        "--time",
+        action="append",
+        dest="times",
+        help="每日执行时间 HH:MM；可重复或用逗号分隔（默认 23:30）",
+    )
+    parser.add_argument("--run-now", action="store_true", help="启动定时器时先立即执行一次")
+    parser.add_argument("--remote", default="origin", help="推送的远程仓库名")
+    parser.add_argument("--branch", help="推送分支；默认使用当前分支")
+    parser.add_argument("--no-push", action="store_true", help="只提交到本地，不推送")
+    parser.add_argument("--dry-run", action="store_true", help="仅分析和验证，不修改仓库")
+    parser.add_argument("--codex", default="codex", help="Codex CLI 命令或完整路径")
+    parser.add_argument("-m", "--model", help="可选的 Codex 模型名称")
+    parser.add_argument("--language", choices=("zh", "en"), default="zh")
+    parser.add_argument("--live", action="store_true", help="实时显示 Codex 执行过程")
+    parser.add_argument("--timeout", type=int, default=300, help="Codex 超时秒数")
+    parser.add_argument("--log-file", type=Path, help="同时写入日志文件")
+    email_group = parser.add_mutually_exclusive_group()
+    email_group.add_argument(
+        "--email",
+        action="store_true",
+        help="要求启用邮件；配置不完整时立即报错",
+    )
+    email_group.add_argument(
+        "--no-email",
+        action="store_true",
+        help="本次运行不发送邮件",
+    )
+    parser.add_argument("--mail-sender", help="发件邮箱；优先于 MAIL_SENDER")
+    parser.add_argument(
+        "--mail-auth-code",
+        help="SMTP 授权码；优先于 MAIL_AUTH_CODE（使用环境变量更安全）",
+    )
+    parser.add_argument(
+        "--mail-recipients",
+        help="收件邮箱，多个用逗号或分号分隔；优先于 MAIL_RECIPIENTS",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    return parser
+
+
+def configure_logging(log_file: Path | None) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    if log_file is not None:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def configure_console_encoding() -> None:
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def main(argv: list[str] | None = None) -> int:
+    configure_console_encoding()
+    args = build_parser().parse_args(argv)
+    configure_logging(args.log_file)
+    if args.timeout < 1:
+        print("错误：--timeout 必须大于 0", file=sys.stderr)
+        return 2
+    if args.once and args.run_now:
+        print("错误：--once 已经会立即执行，不能同时使用 --run-now", file=sys.stderr)
+        return 2
+
+    config = RunConfig(
+        repo=args.repo,
+        remote=args.remote,
+        branch=args.branch,
+        push=not args.no_push,
+        dry_run=args.dry_run,
+        codex_command=args.codex,
+        model=args.model,
+        timeout=args.timeout,
+        live=args.live,
+        language=args.language,
+    )
+    try:
+        email_config = (
+            None
+            if args.no_email
+            else load_email_config(
+                required=args.email,
+                sender=args.mail_sender,
+                auth_code=args.mail_auth_code,
+                recipients=args.mail_recipients,
+            )
+        )
+        if args.once:
+            outcome = execute_and_notify(config, email_config)
+            print(format_outcome(outcome))
+            return 0
+        schedule = parse_schedule_times(args.times or ["23:30"])
+        run_scheduler(
+            config,
+            schedule,
+            email_config=email_config,
+            run_now=args.run_now,
+        )
+        return 0
+    except (AutoCommitError, advisor.AdvisorError) as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n已停止定时任务。", file=sys.stderr)
+        return 130
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

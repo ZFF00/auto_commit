@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "2.4.0"
+VERSION = "3.0.0"
 
 SENSITIVE_OUTPUT_PATTERN = re.compile(
     r"(?i)(\b(?:api[_-]?key|secret|token|password|passwd|pwd|authorization)\b\s*[:=]\s*)"

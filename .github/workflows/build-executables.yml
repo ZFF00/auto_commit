@@ -1,0 +1,76 @@
+name: Build executables
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - ".github/workflows/build-executables.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: auto_commit-windows-x86_64
+            executable: auto_commit-windows-x86_64.exe
+          - os: ubuntu-22.04
+            artifact: auto_commit-linux-x86_64
+            executable: auto_commit-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install builder
+        run: python -m pip install --disable-pip-version-check pyinstaller==6.15.0
+
+      - name: Run tests
+        run: python -B -m unittest discover -q
+
+      - name: Build single-file executable
+        shell: bash
+        run: >-
+          pyinstaller
+          --onefile
+          --clean
+          --noconfirm
+          --optimize 2
+          --name "${{ matrix.executable }}"
+          --exclude-module asyncio
+          --exclude-module doctest
+          --exclude-module multiprocessing
+          --exclude-module pydoc
+          --exclude-module sqlite3
+          --exclude-module tkinter
+          --exclude-module unittest
+          auto_commit.py
+
+      - name: Verify executable
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            "dist/${{ matrix.executable }}" --version
+            "dist/${{ matrix.executable }}" --help >/dev/null
+          else
+            chmod +x "dist/${{ matrix.executable }}"
+            "dist/${{ matrix.executable }}" --version
+            "dist/${{ matrix.executable }}" --help >/dev/null
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.executable }}
+          if-no-files-found: error
+          compression-level: 9
+          retention-days: 30

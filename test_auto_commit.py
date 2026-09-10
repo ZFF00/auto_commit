@@ -1,106 +1,543 @@
-import json
+import datetime as dt
+import io
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import auto_commit_v2 as auto_commit
+import auto_commit
+import email_notifier
 
 
-@unittest.skip("兼容占位；v2 测试位于 test_auto_commit_v2.py")
-class AutoCommitTests(unittest.TestCase):
-    def test_resolve_explicit_codex_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            executable = Path(directory) / "codex.cmd"
-            executable.touch()
-            self.assertEqual(
-                auto_commit.resolve_codex_command(str(executable)),
-                str(executable.resolve()),
-            )
+def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["git", *arguments],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or result.stdout)
+    return result
 
-    @unittest.skipUnless(auto_commit.os.name == "nt", "Windows fallback")
-    def test_resolve_codex_from_windows_npm_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
-            app_data = Path(directory)
-            executable = app_data / "npm" / "codex.cmd"
-            executable.parent.mkdir()
-            executable.touch()
-            with mock.patch.object(auto_commit.shutil, "which", return_value=None):
-                with mock.patch.dict(
-                    auto_commit.os.environ,
-                    {"APPDATA": str(app_data), "LOCALAPPDATA": str(app_data / "local")},
-                ):
-                    self.assertEqual(
-                        auto_commit.resolve_codex_command("codex"),
-                        str(executable.resolve()),
-                    )
 
-    def test_sensitive_path_detection(self):
-        self.assertTrue(auto_commit.is_sensitive_path(".env"))
-        self.assertTrue(auto_commit.is_sensitive_path("config/.env.production"))
-        self.assertTrue(auto_commit.is_sensitive_path("certs/server.key"))
-        self.assertFalse(auto_commit.is_sensitive_path(".env.example"))
-        self.assertFalse(auto_commit.is_sensitive_path("src/tokenizer.py"))
-
-    def test_sensitive_assignments_are_redacted(self):
-        source = '+API_KEY="do-not-send"\n+normal = 1\n-password: old'
-        result = auto_commit.redact_sensitive_lines(source)
-        self.assertNotIn("do-not-send", result)
-        self.assertNotIn("old", result)
-        self.assertIn("normal = 1", result)
-
-    def test_parse_fenced_json(self):
-        payload = {
-            "clean": False,
-            "branch": "main",
-            "summary": "ok",
-            "ignore_recommendations": [],
-            "commit": {},
-            "cautions": [],
+def commit_result(
+    *,
+    included: list[str],
+    excluded: list[str] | None = None,
+    manual: list[str] | None = None,
+    cautions: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    excluded = excluded or []
+    manual = manual or []
+    recommendations = [
+        {
+            "path": path,
+            "reason": "可重新生成",
+            "gitignore_pattern": "__pycache__/" if "__pycache__" in path else f"/{path}",
+            "tracked": False,
+            "confidence": "high",
         }
-        result = auto_commit.parse_codex_result(
-            f"```json\n{json.dumps(payload)}\n```"
+        for path in excluded
+    ]
+    return {
+        "clean": not (included or excluded or manual),
+        "branch": "main",
+        "summary": "测试分析结果",
+        "ignore_recommendations": recommendations,
+        "commit": {
+            "title": "chore: back up repository",
+            "body": ["Back up reviewed files."],
+            "full_message": "chore: back up repository\n\nBack up reviewed files.",
+            "included_paths": included,
+            "excluded_paths": excluded,
+            "manual_review_paths": manual,
+        },
+        "cautions": cautions or [],
+    }
+
+
+def fake_analyzer(result: dict[str, object]):
+    def analyze(repo: Path, **kwargs: object):
+        return repo.resolve(), result
+
+    return analyze
+
+
+class AutoCommitWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def make_repo(self, *, with_remote: bool = True) -> tuple[Path, Path | None]:
+        repo = self.root / "work"
+        repo.mkdir()
+        git(repo, "init", "--initial-branch=main")
+        git(repo, "config", "user.name", "Test User")
+        git(repo, "config", "user.email", "test@example.com")
+        remote = None
+        if with_remote:
+            remote = self.root / "remote.git"
+            remote.mkdir()
+            git(remote, "init", "--bare")
+            git(repo, "remote", "add", "origin", str(remote))
+        return repo, remote
+
+    def test_execute_once_updates_gitignore_commits_and_pushes(self):
+        repo, remote = self.make_repo()
+        (repo / "app.py").write_text("print('backup')\n", encoding="utf-8")
+        cache = repo / "__pycache__" / "app.cpython-312.pyc"
+        cache.parent.mkdir()
+        cache.write_bytes(b"generated bytecode")
+        result = commit_result(
+            included=["app.py"],
+            excluded=["__pycache__/app.cpython-312.pyc"],
         )
-        self.assertEqual(result["summary"], "ok")
 
-    def test_snapshot_does_not_read_sensitive_untracked_file(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self._git(repo, "init")
-            self._git(repo, "config", "user.email", "test@example.com")
-            self._git(repo, "config", "user.name", "Test User")
-            (repo / "app.py").write_text("print('old')\n", encoding="utf-8")
-            self._git(repo, "add", "app.py")
-            self._git(repo, "commit", "-m", "initial")
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo),
+            analyzer=fake_analyzer(result),
+        )
 
-            (repo / "app.py").write_text("print('new')\n", encoding="utf-8")
-            (repo / "new.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (repo / ".env").write_text("SECRET=must-not-leak\n", encoding="utf-8")
+        self.assertEqual(outcome.status, "committed")
+        self.assertTrue(outcome.pushed)
+        self.assertEqual(outcome.added_ignore_patterns, ("__pycache__/",))
+        self.assertIn("__pycache__/", (repo / ".gitignore").read_text(encoding="utf-8"))
+        committed = set(
+            git(repo, "show", "--pretty=format:", "--name-only", "HEAD").stdout.splitlines()
+        )
+        self.assertEqual(committed, {".gitignore", "app.py"})
+        self.assertEqual(git(repo, "status", "--short").stdout, "")
+        self.assertEqual(
+            git(repo, "rev-parse", "HEAD").stdout.strip(),
+            git(remote, "rev-parse", "refs/heads/main").stdout.strip(),
+        )
 
-            snapshot = auto_commit.collect_snapshot(
-                repo,
-                max_input_chars=100_000,
-                include_untracked_content=True,
+    def test_clean_run_pushes_existing_unpushed_commit(self):
+        repo, remote = self.make_repo()
+        (repo / "note.txt").write_text("backup\n", encoding="utf-8")
+        git(repo, "add", "note.txt")
+        git(repo, "commit", "-m", "initial backup")
+        analyze = mock.Mock(side_effect=AssertionError("clean run must not call Codex"))
+
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo),
+            analyzer=analyze,
+        )
+
+        self.assertEqual(outcome.status, "clean")
+        self.assertTrue(outcome.pushed)
+        analyze.assert_not_called()
+        self.assertEqual(
+            git(repo, "rev-parse", "HEAD").stdout.strip(),
+            git(remote, "rev-parse", "refs/heads/main").stdout.strip(),
+        )
+
+    def test_missing_remote_stops_before_codex_analysis(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "app.py").write_text("print('backup')\n", encoding="utf-8")
+        analyze = mock.Mock(side_effect=AssertionError("Codex must not be called"))
+
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "找不到 Git 远程仓库"):
+            auto_commit.execute_once(
+                auto_commit.RunConfig(repo=repo),
+                analyzer=analyze,
             )
-            prompt = auto_commit.build_prompt(snapshot, "zh")
 
-            self.assertIn("app.py", snapshot.changed_paths)
-            self.assertIn("new.py", snapshot.untracked_paths)
-            self.assertIn("VALUE = 1", prompt)
-            self.assertIn(".env", prompt)
-            self.assertNotIn("must-not-leak", prompt)
+        analyze.assert_not_called()
+        self.assertFalse(auto_commit.has_head(repo))
 
-    @staticmethod
-    def _git(repo: Path, *arguments: str) -> None:
-        subprocess.run(
-            ["git", *arguments],
-            cwd=repo,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
+    def test_push_failure_keeps_local_commit(self):
+        repo, _ = self.make_repo(with_remote=False)
+        missing_remote = self.root / "missing-remote.git"
+        git(repo, "remote", "add", "origin", str(missing_remote))
+        (repo / "app.py").write_text("print('backup')\n", encoding="utf-8")
+        result = commit_result(included=["app.py"])
+
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "git push"):
+            auto_commit.execute_once(
+                auto_commit.RunConfig(repo=repo),
+                analyzer=fake_analyzer(result),
+            )
+
+        self.assertTrue(auto_commit.has_head(repo))
+        self.assertEqual(
+            git(repo, "show", "--pretty=format:", "--name-only", "HEAD").stdout.strip(),
+            "app.py",
         )
+
+    def test_dry_run_does_not_modify_commit_or_gitignore(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "app.py").write_text("print('backup')\n", encoding="utf-8")
+        result = commit_result(included=["app.py"])
+
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo, dry_run=True),
+            analyzer=fake_analyzer(result),
+        )
+
+        self.assertEqual(outcome.status, "dry-run")
+        self.assertFalse((repo / ".gitignore").exists())
+        self.assertFalse(auto_commit.has_head(repo))
+        self.assertEqual(git(repo, "status", "--short").stdout.strip(), "?? app.py")
+
+    def test_manual_review_blocks_real_run_before_writing(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "archive.bin").write_bytes(b"unknown")
+        result = commit_result(included=[], manual=["archive.bin"])
+
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "需人工确认"):
+            auto_commit.execute_once(
+                auto_commit.RunConfig(repo=repo, push=False),
+                analyzer=fake_analyzer(result),
+            )
+
+        self.assertFalse((repo / ".gitignore").exists())
+        self.assertFalse(auto_commit.has_head(repo))
+
+    def test_blocking_caution_stops_real_automatic_commit(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "settings.py").write_text("TOKEN = 'secret'\n", encoding="utf-8")
+        result = commit_result(
+            included=["settings.py"],
+            cautions=[
+                {
+                    "path": "settings.py",
+                    "reason": "疑似包含真实凭据",
+                    "blocking": True,
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "阻断风险"):
+            auto_commit.execute_once(
+                auto_commit.RunConfig(repo=repo, push=False),
+                analyzer=fake_analyzer(result),
+            )
+
+    def test_dry_run_reports_manual_review_without_failing(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "archive.bin").write_bytes(b"unknown")
+        result = commit_result(included=[], manual=["archive.bin"])
+
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo, dry_run=True),
+            analyzer=fake_analyzer(result),
+        )
+
+        self.assertEqual(outcome.status, "dry-run")
+        self.assertIn("需人工确认：\n- archive.bin", outcome.report)
+        self.assertFalse(auto_commit.has_head(repo))
+
+    def test_plan_must_cover_every_changed_path(self):
+        result = commit_result(included=["app.py"])
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "未分类"):
+            auto_commit.validate_plan(result, {"app.py", "README.md"})
+
+    def test_plan_rejects_broad_ignore_pattern(self):
+        result = commit_result(included=[], excluded=["cache.bin"])
+        result["ignore_recommendations"][0]["gitignore_pattern"] = "*"
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "过宽"):
+            auto_commit.validate_plan(result, {"cache.bin"})
+
+    def test_plan_rejects_clean_result_when_changes_exist(self):
+        result = commit_result(included=["app.py"])
+        result["clean"] = True
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "clean=true"):
+            auto_commit.validate_plan(result, {"app.py"})
+
+    def test_plan_rejects_credential_in_commit_message(self):
+        result = commit_result(included=["app.py"])
+        result["commit"]["full_message"] = "chore: use TOKEN=do-not-commit"
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "疑似包含凭据"):
+            auto_commit.validate_plan(result, {"app.py"})
+
+    def test_ignore_rules_must_not_match_included_paths(self):
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "误伤"):
+            auto_commit.validate_ignore_matches(
+                ["*.py"],
+                excluded_paths=["cache.py"],
+                protected_paths=["app.py"],
+            )
+
+    def test_staged_excluded_file_blocks_commit(self):
+        repo, _ = self.make_repo(with_remote=False)
+        cache = repo / "__pycache__" / "app.cpython-312.pyc"
+        cache.parent.mkdir()
+        cache.write_bytes(b"generated bytecode")
+        git(repo, "add", str(cache.relative_to(repo)))
+        result = commit_result(
+            included=[], excluded=["__pycache__/app.cpython-312.pyc"]
+        )
+
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "已经暂存"):
+            auto_commit.execute_once(
+                auto_commit.RunConfig(repo=repo, dry_run=True),
+                analyzer=fake_analyzer(result),
+            )
+
+    def test_repository_lock_rejects_second_process(self):
+        repo, _ = self.make_repo(with_remote=False)
+        with auto_commit.RepositoryLock(repo):
+            with self.assertRaisesRegex(auto_commit.AutoCommitError, "另一个自动提交任务"):
+                with auto_commit.RepositoryLock(repo):
+                    pass
+
+    def test_stage_paths_treats_git_metacharacters_literally(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "[ab].txt").write_text("literal\n", encoding="utf-8")
+        (repo / "a.txt").write_text("must stay untracked\n", encoding="utf-8")
+
+        auto_commit.stage_paths(repo, ["[ab].txt"])
+
+        self.assertEqual(auto_commit.list_staged_paths(repo), {"[ab].txt"})
+        self.assertIn("?? a.txt", git(repo, "status", "--short").stdout)
+
+
+class SchedulingTests(unittest.TestCase):
+    def test_load_email_config_reads_mail_environment(self):
+        config = auto_commit.load_email_config(
+            {
+                "MAIL_SENDER": "sender@qq.com",
+                "MAIL_AUTH_CODE": "authorization-code",
+                "MAIL_RECIPIENTS": "first@example.com, second@example.com",
+            }
+        )
+        self.assertIsNotNone(config)
+        self.assertEqual(config.host, "smtp.qq.com")
+        self.assertEqual(config.port, 465)
+        self.assertEqual(config.security, "ssl")
+        self.assertEqual(config.policy, "always")
+        self.assertEqual(config.sender_name, "Codex Git 推送")
+        self.assertEqual(config.timeout, 30)
+        self.assertEqual(
+            config.recipients, ("first@example.com", "second@example.com")
+        )
+
+    def test_load_email_config_explicit_values_override_environment(self):
+        config = auto_commit.load_email_config(
+            {
+                "MAIL_SENDER": "environment@qq.com",
+                "MAIL_AUTH_CODE": "environment-code",
+                "MAIL_RECIPIENTS": "environment@example.com",
+            },
+            sender="explicit@qq.com",
+            auth_code="explicit-code",
+            recipients="first@example.com;second@example.com",
+        )
+        self.assertEqual(config.username, "explicit@qq.com")
+        self.assertEqual(config.password, "explicit-code")
+        self.assertEqual(
+            config.recipients, ("first@example.com", "second@example.com")
+        )
+
+    def test_load_email_config_falls_back_per_missing_explicit_value(self):
+        config = auto_commit.load_email_config(
+            {
+                "MAIL_SENDER": "environment@qq.com",
+                "MAIL_AUTH_CODE": "environment-code",
+                "MAIL_RECIPIENTS": "environment@example.com",
+            },
+            recipients="explicit@example.com",
+        )
+        self.assertEqual(config.username, "environment@qq.com")
+        self.assertEqual(config.password, "environment-code")
+        self.assertEqual(config.recipients, ("explicit@example.com",))
+
+    def test_load_email_config_returns_none_when_unconfigured(self):
+        self.assertIsNone(auto_commit.load_email_config({}))
+
+    def test_load_email_config_required_rejects_unconfigured(self):
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "MAIL_SENDER"):
+            auto_commit.load_email_config({}, required=True)
+
+    def test_load_email_config_rejects_partial_configuration(self):
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "MAIL_AUTH_CODE"):
+            auto_commit.load_email_config(
+                {
+                    "MAIL_SENDER": "sender@qq.com",
+                    "MAIL_RECIPIENTS": "backup@example.com",
+                }
+            )
+
+    def test_load_email_config_unknown_provider_requires_host(self):
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "MAIL_SMTP_HOST"):
+            auto_commit.load_email_config(
+                {
+                    "MAIL_SENDER": "sender@example.com",
+                    "MAIL_AUTH_CODE": "authorization-code",
+                    "MAIL_RECIPIENTS": "backup@example.com",
+                }
+            )
+
+    def test_execute_and_notify_sends_success(self):
+        outcome = auto_commit.RunOutcome(
+            repository=Path.cwd(),
+            branch="main",
+            status="committed",
+            report="提交成功",
+            commit_hash="abc123",
+            pushed=True,
+        )
+        mail_config = email_notifier.EmailConfig(
+            recipients=("backup@example.com",),
+            host="smtp.example.com",
+            port=465,
+            username="sender@example.com",
+            password="authorization-code",
+        )
+        sender = mock.Mock(return_value=True)
+        with mock.patch.object(auto_commit, "execute_once", return_value=outcome):
+            result = auto_commit.execute_and_notify(
+                auto_commit.RunConfig(repo=Path.cwd()),
+                mail_config,
+                email_sender=sender,
+            )
+        self.assertEqual(result, outcome)
+        sent_notification = sender.call_args.args[1]
+        self.assertTrue(sent_notification.success)
+        self.assertEqual(sent_notification.commit_hash, "abc123")
+
+    def test_remote_repository_preserves_configured_ssh_url(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            repo = Path(temporary_directory)
+            git(repo, "init")
+            git(
+                repo,
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:ZFF00/auto_commit.git",
+            )
+
+            self.assertEqual(
+                auto_commit._remote_repository(repo, "origin"),
+                "git@github.com:ZFF00/auto_commit.git",
+            )
+
+    def test_execute_and_notify_sends_failure_then_reraises(self):
+        mail_config = email_notifier.EmailConfig(
+            recipients=("backup@example.com",),
+            host="smtp.example.com",
+            port=465,
+            username="sender@example.com",
+            password="authorization-code",
+        )
+        sender = mock.Mock(return_value=True)
+        with mock.patch.object(
+            auto_commit,
+            "execute_once",
+            side_effect=auto_commit.AutoCommitError("push failed"),
+        ):
+            with self.assertRaisesRegex(auto_commit.AutoCommitError, "push failed"):
+                auto_commit.execute_and_notify(
+                    auto_commit.RunConfig(repo=Path.cwd()),
+                    mail_config,
+                    email_sender=sender,
+                )
+        sent_notification = sender.call_args.args[1]
+        self.assertFalse(sent_notification.success)
+        self.assertIn("push failed", sent_notification.summary)
+
+    def test_parse_schedule_times_accepts_repeated_and_comma_values(self):
+        result = auto_commit.parse_schedule_times(["18:30,09:00", "18:30"])
+        self.assertEqual(result, (dt.time(9, 0), dt.time(18, 30)))
+
+    def test_parse_schedule_times_rejects_invalid_time(self):
+        with self.assertRaisesRegex(auto_commit.AutoCommitError, "无效的执行时间"):
+            auto_commit.parse_schedule_times(["25:00"])
+
+    def test_next_run_time_uses_today_or_tomorrow(self):
+        schedule = (dt.time(9, 0), dt.time(18, 0))
+        morning = auto_commit.next_run_time(dt.datetime(2026, 9, 9, 10), schedule)
+        evening = auto_commit.next_run_time(dt.datetime(2026, 9, 9, 19), schedule)
+        self.assertEqual(morning, dt.datetime(2026, 9, 9, 18))
+        self.assertEqual(evening, dt.datetime(2026, 9, 10, 9))
+
+    def test_main_once_prints_outcome(self):
+        outcome = auto_commit.RunOutcome(
+            repository=Path.cwd(),
+            branch="main",
+            status="clean",
+            report="工作区干净",
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(auto_commit, "execute_and_notify", return_value=outcome):
+            with redirect_stdout(stdout):
+                return_code = auto_commit.main(["--once", "--dry-run"])
+        self.assertEqual(return_code, 0)
+        self.assertIn("工作区干净", stdout.getvalue())
+
+    def test_main_passes_explicit_email_values_to_configuration(self):
+        outcome = auto_commit.RunOutcome(
+            repository=Path.cwd(),
+            branch="main",
+            status="clean",
+            report="工作区干净",
+        )
+        with mock.patch.object(
+            auto_commit, "load_email_config", return_value=None
+        ) as load_email:
+            with mock.patch.object(
+                auto_commit, "execute_and_notify", return_value=outcome
+            ):
+                with redirect_stdout(io.StringIO()):
+                    return_code = auto_commit.main(
+                        [
+                            "--once",
+                            "--mail-sender",
+                            "sender@qq.com",
+                            "--mail-auth-code",
+                            "authorization-code",
+                            "--mail-recipients",
+                            "receiver@example.com",
+                        ]
+                    )
+        self.assertEqual(return_code, 0)
+        load_email.assert_called_once_with(
+            required=False,
+            sender="sender@qq.com",
+            auth_code="authorization-code",
+            recipients="receiver@example.com",
+        )
+
+    def test_main_reports_invalid_timeout(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            return_code = auto_commit.main(["--once", "--timeout", "0"])
+        self.assertEqual(return_code, 2)
+        self.assertIn("必须大于 0", stderr.getvalue())
+
+    def test_scheduler_run_now_executes_once_before_waiting(self):
+        outcome = auto_commit.RunOutcome(
+            repository=Path.cwd(),
+            branch="main",
+            status="clean",
+            report="工作区干净",
+        )
+        sleeper = mock.Mock(side_effect=KeyboardInterrupt)
+        stdout = io.StringIO()
+        with mock.patch.object(auto_commit, "execute_once", return_value=outcome) as execute:
+            with redirect_stdout(stdout):
+                with self.assertRaises(KeyboardInterrupt):
+                    auto_commit.run_scheduler(
+                        auto_commit.RunConfig(repo=Path.cwd()),
+                        (dt.time(23, 30),),
+                        run_now=True,
+                        clock=lambda: dt.datetime(2026, 9, 9, 12),
+                        sleeper=sleeper,
+                    )
+        execute.assert_called_once()
+        sleeper.assert_called_once()
+        self.assertIn("工作区干净", stdout.getvalue())
 
 
 if __name__ == "__main__":

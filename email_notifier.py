@@ -1,4 +1,4 @@
-"""SMTP email notifications for automatic Git backup tasks."""
+"""SMTP email notifications for automatic Git push tasks."""
 
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ from urllib.parse import urlsplit, urlunsplit
 
 EmailPolicy = Literal["always", "changes", "failures"]
 EmailSecurity = Literal["ssl", "starttls", "none"]
+
+__all__ = [
+    "EmailConfig",
+    "EmailNotificationError",
+    "TaskNotification",
+    "build_message",
+    "send_notification",
+    "should_send",
+]
 
 
 class EmailNotificationError(RuntimeError):

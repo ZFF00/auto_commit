@@ -1,150 +1,257 @@
-# 自动提交代码到远程仓库
+# Codex Git 自动推送工具
 
-`auto_commit.py` 是一个用于自动提交代码到远程仓库的脚本，并在提交成功或失败时发送邮件通知。该工具特别适用于需要定期备份代码、自动化部署流程或保持仓库活跃度的场景。
+这是一个面向 Git 仓库完整留存场景的自动提交与推送工具。它由三个职责独立的模块组成：
 
-## 功能特性
+当前版本：`3.0.0`
 
-- ✅ 定时自动提交代码变更
-- ✅ 支持多个时间点定时执行
-- ✅ 邮件通知提交结果（成功/失败）
-- ✅ 详细的日志记录
+- `codex_git_advisor.py`：让本机 Codex 以只读方式检查仓库，给出应包含、应忽略、需人工确认的路径，以及 `.gitignore` 规则和 commit message；
+- `auto_commit.py`：执行单次任务或定时调度，安全地更新 `.gitignore`、暂存批准的文件、提交、推送并发送邮件通知；
+- `email_notifier.py`：生成纯文本与 HTML 邮件并通过 SMTP 发送。
 
+## 主要行为
 
-## 安装要求
+- 以完整备份为目标，源码、测试、文档、共享配置和有价值的旧版本默认提交；
+- 只自动忽略 Codex 判定为 `high` 置信度的缓存、日志、生成文件等内容；
+- 用 Git 实际验证忽略规则，规则未覆盖目标文件或会误伤应提交文件时停止；
+- Codex 必须为每一个当前变更路径分类，漏项、多项重叠或返回仓库外路径时停止；
+- 有大文件用途不明、疑似真实凭据或其他阻断风险时停止自动提交；
+- `--live` 会对常见密钥、Token 和密码赋值进行脱敏后再显示；
+- 只暂存 Codex 批准的路径，不使用笼统的 `git add .`；
+- 使用仓库内锁文件防止两个任务同时运行；
+- 推送失败时保留已经完成的本地提交；下一次任务即使没有新改动，也会跳过 Codex 并直接再次推送。
+- 邮件同时包含纯文本和 HTML 版本，并按成功、无变化、演练或失败显示不同状态。
 
-### 系统要求
-- Python 3
-- Git 2.0+
-- 网络连接（用于推送到远程仓库和发送邮件）
+## 环境要求
 
-### Python依赖
-```bash
-pip install schedule
+- Python 3.10+
+- Git
+- 已安装并登录 Codex CLI
+- Git 仓库已配置提交用户名、邮箱和远程仓库
+
+检查环境：
+
+```powershell
+codex --version
+codex login
+git config user.name
+git config user.email
+git remote -v
 ```
 
-### Git配置
-确保本地Git已配置用户信息和远程仓库访问权限：
-```bash
-git config --global user.name "Your Name"
-git config --global user.email "your.email@example.com"
+如果当前仓库还没有远程仓库，可配置为：
+
+```powershell
+git remote add origin git@github.com:OWNER/REPOSITORY.git
 ```
 
-## 使用方法
-```bash
-usage: auto_commit.py [-h] -r REPO -o REMOTE -b BRANCH [-t TIME] [-e RECEIVER_MAIL] [-l LOG]
+脚本只使用 Python 标准库，不需要额外安装 Python 包。在 Windows 上会自动查找 PATH、npm 全局目录和 Codex Desktop 中的 `codex.exe`；仍无法定位时可以通过 `--codex` 指定完整路径。
 
-自动定时提交代码到远程仓库并发送提示邮件
+## 可执行文件
 
-options:
-  -h, --help            show this help message and exit
-  -r REPO, --repo REPO  本地git仓库路径 (必须参数)
-  -o REMOTE, --remote REMOTE  远程仓库标识 (必须参数)
-  -b BRANCH, --branch BRANCH  远程仓库分支 (必须参数)
-  -t, --time TIME       每日定时提交时间, 格式：HH:MM，多个时间用逗号分隔 (必须参数, default: 23:30)
-  -e RECEIVER_MAIL, --receiver_mail RECEIVER_MAIL   收件人邮箱，不指定该参数则不发送邮件 (可选参数)
-  -l LOG, --log LOG     日志文件 (必须参数, default: auto_commit.log)
+项目为 64 位 Windows 和 64 位 Linux 构建单文件程序：
+
+- `auto_commit-windows-x86_64.exe`
+- `auto_commit-linux-x86_64`
+
+可执行文件无需安装 Python，但仍需要系统提供 Git 和 Codex CLI。Windows 版本可直接在命令提示符或 PowerShell 中运行：
+
+```powershell
+.\auto_commit-windows-x86_64.exe --once --live
 ```
 
-### 参数说明
+Linux 版本首次运行前需要增加执行权限：
 
-| 参数 | 简写 | 类型 | 必需 | 默认值 | 说明 |
-|------|------|------|------|--------|------|
-| `--repo` | `-r` | string | ✅ | - | 本地Git仓库的绝对路径 |
-| `--remote` | `-o` | string | ✅ | - | 远程仓库名称（通常是origin） |
-| `--branch` | `-b` | string | ✅ | - | 目标分支名称 |
-| `--time` | `-t` | string | ❌ | 23:30 | 定时执行时间，格式HH:MM，多个时间用逗号分隔 |
-| `--receiver_mail` | `-e` | string | ❌ | - | 接收通知的邮箱地址 |
-| `--log` | `-l` | string | ❌ | auto_commit.log | 日志文件路径 |
-
-
-## 使用示例
-
-### 基础使用
 ```bash
-# 每天23:30自动提交到main分支
-python auto_commit.py -r /home/user/my_project -o origin -b main
+chmod +x auto_commit-linux-x86_64
+./auto_commit-linux-x86_64 --once --live
 ```
 
-### 多时间点提交
-```bash
-# 每天09:00和18:00自动提交
-python auto_commit.py -r /home/user/my_project -o origin -b main -t 09:00,18:00
+每次向 `main` 推送 Python 源码时，GitHub Actions 都会重新构建并验证两个平台的程序。构建产物保留 30 天，可在仓库的 Actions 页面下载。它们属于可重新生成的发布产物，不提交到 Git。
+
+## 首次演练
+
+建议先执行只读演练。它会真实调用 Codex 并验证结果，但不会修改 `.gitignore`、暂存、提交或推送：
+
+```powershell
+python auto_commit.py --once --dry-run --live
 ```
 
-### 带邮件通知
-```bash
-# 提交并发送邮件通知
-python auto_commit.py -r /home/user/my_project -o origin -b main -t 23:30 -e admin@company.com
+如果输出含有“需人工确认”或“阻断自动提交”，先处理对应问题再正式运行。
+
+## 单次提交并推送
+
+使用当前目录、`origin` 远程仓库和当前分支：
+
+```powershell
+python auto_commit.py --once --live
 ```
 
-### 自定义日志文件
-```bash
-# 指定日志文件位置
-python auto_commit.py -r /home/user/my_project -o origin -b main -l /var/log/auto_commit.log
+指定仓库、远程仓库和目标分支：
+
+```powershell
+python auto_commit.py --once --repo D:\work\project --remote origin --branch main --live
 ```
 
-### 后台运行（推荐）
-```bash
-# 使用nohup在后台运行
-nohup python auto_commit.py -r /home/user/my_project -o origin -b main -t 23:30 -e admin@company.com > /dev/null 2>&1 &
+只创建本地提交、不推送：
 
-# 或使用screen/tmux
-screen -S auto_commit
-python auto_commit.py -r /home/user/my_project -o origin -b main -t 23:30 -e admin@company.com
-# Ctrl+A+D 分离会话
+```powershell
+python auto_commit.py --once --no-push
 ```
 
+## 邮件通知
 
-## 工作流程
+发件邮箱、SMTP 授权码和收件邮箱既可以在本次命令中指定，也可以通过环境变量提供。命令行显式指定的值优先，未指定的项再逐项读取环境变量。
 
-1. **初始化**: 检查Git仓库状态和远程连接
-2. **定时检查**: 按设定时间检查是否有代码变更
-3. **自动提交**: 发现变更时自动add、commit和push
-4. **通知发送**: 根据操作结果发送邮件通知
-5. **日志记录**: 记录所有操作和错误信息
+直接指定本次运行使用的值：
 
-## 故障排除
-
-### 常见问题
-
-**Q: 脚本运行后没有反应？**
-A: 检查当前时间是否已过设定的提交时间，脚本会在下一个设定时间点执行。
-
-**Q: 推送失败怎么办？**
-A: 检查网络连接、Git权限配置和远程仓库状态。
-
-**Q: 邮件发送失败？**
-A: 确认SMTP配置正确，检查网络连接和邮箱服务器设置。
-
-**Q: 如何停止自动提交？**
-A: 找到进程ID并终止：
-```bash
-ps aux | grep auto_commit.py
-kill <进程ID>
+```powershell
+python auto_commit.py --once --mail-sender "sender@qq.com" --mail-auth-code "SMTP授权码" --mail-recipients "receiver@example.com"
 ```
 
-### 日志分析
+授权码出现在命令行时可能被终端历史或进程查看工具记录，因此长期定时任务更适合使用环境变量：
 
-日志文件包含以下信息：
-- 脚本启动时间
-- 每次检查的时间戳
-- Git操作结果
-- 邮件发送状态
-- 错误详情和堆栈信息
+```powershell
+$env:MAIL_SENDER = "sender@qq.com"
+$env:MAIL_AUTH_CODE = "在邮箱后台生成的SMTP授权码"
+$env:MAIL_RECIPIENTS = "receiver@example.com"
+python auto_commit.py --once --live
+```
 
-## 最佳实践
+多个收件邮箱可以用逗号或分号分隔：
 
-1. **测试环境**: 首先在测试仓库上验证脚本功能
-2. **权限管理**: 使用SSH密钥或Personal Access Token进行Git认证
-3. **监控日志**: 定期检查日志文件，及时发现问题
-4. **备份配置**: 保存脚本配置和重要设置
-5. **网络稳定**: 确保服务器网络连接稳定
+```powershell
+$env:MAIL_RECIPIENTS = "first@example.com,second@example.com"
+```
 
+上述写法只对当前 PowerShell 窗口有效。要保存为 Windows 当前用户的持久环境变量：
 
-## 更新日志
+```powershell
+[Environment]::SetEnvironmentVariable("MAIL_SENDER", "sender@qq.com", "User")
+[Environment]::SetEnvironmentVariable("MAIL_AUTH_CODE", "在邮箱后台生成的SMTP授权码", "User")
+[Environment]::SetEnvironmentVariable("MAIL_RECIPIENTS", "receiver@example.com", "User")
+```
 
-- **v1.0.0**: 初始版本，支持基础的定时提交和邮件通知功能
+设置后需要重新打开终端或重新启动定时任务。不要把真实授权码写进 `.env`、脚本、README 或命令行。
 
----
+QQ、163、126、Gmail、Outlook、Hotmail 和 Live 邮箱会自动推断 SMTP 服务器、端口和安全模式。其他邮箱还需设置：
 
-如有问题或建议，请通过Issue联系我们。
+```powershell
+$env:MAIL_SMTP_HOST = "smtp.example.com"
+$env:MAIL_SMTP_PORT = "465"
+$env:MAIL_SMTP_SECURITY = "ssl"
+```
+
+邮件固定为所有结果都通知，发件人显示名称为“Codex Git 推送”，SMTP 超时为 30 秒。三项可以混合配置，例如只传 `--mail-recipients` 时，发件邮箱和授权码仍从环境变量读取。只要最终配置完整，邮件会自动启用。`--email` 可要求邮件必须启用并在缺少配置时立即报错；`--no-email` 可临时关闭。邮件标题使用“Git 自动推送”和远程地址中的 `用户/仓库`（例如 `ZFF00/auto_commit`），正文分别展示本地仓库完整路径和 Git 配置中保存的原始远程仓库地址（例如 `git@github.com:ZFF00/auto_commit.git`），并包含分支、时间、commit、推送状态、新增忽略规则和任务报告。
+
+## 内置定时任务
+
+不使用 `--once` 时，脚本进入常驻定时模式。默认每天 `23:30` 执行：
+
+```powershell
+python auto_commit.py --live
+```
+
+每天 `09:00` 和 `18:00` 执行，并在启动时先执行一次：
+
+```powershell
+python auto_commit.py --time 09:00 --time 18:00 --run-now --live --log-file auto_commit.log
+```
+
+时间也可以写成一个逗号分隔参数：
+
+```powershell
+python auto_commit.py --time 09:00,18:00
+```
+
+常驻模式需要终端或后台进程持续运行。也可以使用 Windows 任务计划程序定时调用 `python auto_commit.py --once`，此时调度由 Windows 管理，脚本仍负责完整的单次分析、提交和推送流程。
+
+## 独立查看 Codex 建议
+
+只需要分析报告、不执行任何 Git 写操作时，直接运行：
+
+```powershell
+python codex_git_advisor.py --live
+```
+
+结构化输出：
+
+```powershell
+python codex_git_advisor.py --json
+```
+
+## 单次任务流程
+
+1. 确认目标是 Git 仓库，并解析当前分支。
+2. 正式模式检查 Git 提交身份和远程仓库是否存在。
+3. 获取仓库锁，防止任务重叠。
+4. 如果工作区干净，跳过 Codex 并直接尝试推送当前 `HEAD`。
+5. 如果存在改动，调用 `codex_git_advisor.py`，由 Codex 在仓库目录中执行只读检查。
+6. 验证每个变更文件恰好属于“包含、排除、人工确认”之一。
+7. 验证忽略建议为高置信度、目标未被跟踪、规则足够精确且不会误伤包含路径。
+8. 更新 `.gitignore`，只按字面路径暂存建议包含的文件和本次 `.gitignore` 更新，然后创建本地 commit。
+9. 将当前 `HEAD` 推送到指定远程分支。
+
+脚本不会执行 `git pull`、`git reset`、`git clean`、`git rm --cached` 或强制推送。
+
+## 备份优先的分类规则
+
+- `README.md`、`auto_commit.py`、测试文件和其他有效源码、文档：默认包含；
+- `__pycache__/`、`nohup.out`：通常排除；
+- 无扩展名的 `auto_commit`：确认是可重新生成的 ELF/打包二进制后排除；
+- 明确不需要备份的大型生成数据：排除；
+- 用途、来源或可重新生成性不明确的大文件：人工确认，不会只因体积大就忽略；
+- 含疑似真实密钥、Token 或密码的有效源码：不忽略整个源码，但阻断自动提交，必须先移除并轮换凭据。
+
+文件未跟踪、属于旧版本、与其他文件主题不同、测试失败或建议拆分 commit，都不能作为忽略理由。一般代码质量提醒不会阻止备份，只有泄密、数据损失或错误发布等风险会阻断。
+
+## 失败后的状态
+
+- Codex 调用失败、分类不完整、存在人工确认项或阻断风险：不会修改仓库；
+- 远程仓库或 Git 身份未配置：在调用 Codex 和修改仓库前失败；
+- 本地 commit 成功但 push 失败：本地 commit 会保留，下次任务会再次推送；
+- 写入 `.gitignore` 或暂存后 Git commit 失败：修改和暂存状态会保留，便于人工检查，不会执行自动回滚；
+- 任务异常退出后如果留下 `.git/auto_commit.lock`，确认没有其他任务运行后再人工删除该锁文件。
+
+## 常用参数
+
+```text
+-r, --repo PATH             Git 仓库路径，默认当前目录
+--once                      立即执行一次后退出
+-t, --time HH:MM            每日时间，可重复或逗号分隔
+--run-now                   启动常驻定时器时先执行一次
+--remote NAME               远程仓库名，默认 origin
+--branch NAME               远程分支，默认当前分支
+--no-push                   只提交到本地
+--dry-run                   只分析和验证
+--live                      实时显示 Codex 执行过程
+--timeout SECONDS           Codex 超时，默认 300 秒
+--codex PATH                Codex CLI 命令或完整路径
+--log-file PATH             同时记录运行日志
+--email                     要求启用邮件，最终配置不完整时立即报错
+--no-email                  本次运行临时关闭邮件
+--mail-sender ADDRESS       发件邮箱，优先于 MAIL_SENDER
+--mail-auth-code CODE       SMTP 授权码，优先于 MAIL_AUTH_CODE
+--mail-recipients ADDRESSES 收件邮箱，优先于 MAIL_RECIPIENTS
+```
+
+查看完整帮助：
+
+```powershell
+python auto_commit.py --help
+python codex_git_advisor.py --help
+```
+
+## 测试
+
+```powershell
+python -B -m unittest discover -v
+python -m py_compile auto_commit.py codex_git_advisor.py email_notifier.py test_auto_commit.py test_codex_git_advisor.py test_email_notifier.py
+```
+
+测试使用临时工作仓库和本地裸远程仓库验证真实的 `.gitignore`、commit 与 push，不会访问项目配置的 GitHub 远程仓库。
+
+## 数据与安全边界
+
+Python 脚本不会把预先拼接的仓库快照放入提示词。Codex 直接在目标仓库中使用只读命令检查 Git 状态、差异、文件大小和必要内容；大文件只应抽样读取，疑似敏感文件只根据路径和元数据判断。
+
+Codex 使用 `read-only` 沙箱和临时会话运行，并关闭插件、远程插件、应用、浏览器、计算机控制、多代理和 hooks。大文件抽样及敏感内容限制属于交给 Codex 的任务约束，并不是 Python 层面的文件访问隔离。极高敏感仓库不应直接交给远程模型检查。
