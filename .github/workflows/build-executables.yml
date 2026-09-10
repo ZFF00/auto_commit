@@ -19,10 +19,10 @@ jobs:
         include:
           - os: windows-latest
             artifact: auto_commit-windows-x86_64
-            executable: auto_commit-windows-x86_64.exe
+            executable: auto_commit.exe
           - os: ubuntu-22.04
             artifact: auto_commit-linux-x86_64
-            executable: auto_commit-linux-x86_64
+            executable: auto_commit
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
