@@ -66,6 +66,9 @@ class EmailMessageTests(unittest.TestCase):
         self.assertIn("本地仓库", rendered_html)
         self.assertIn("远程仓库", rendered_html)
         self.assertIn("Git 自动推送", rendered_html)
+        self.assertIn('width="94%"', rendered_html)
+        self.assertIn("width:94%;max-width:none", rendered_html)
+        self.assertNotIn("max-width:720px", rendered_html)
         self.assertEqual(message["Auto-Submitted"], "auto-generated")
 
     def test_subject_supports_https_remote_and_strips_credentials(self):

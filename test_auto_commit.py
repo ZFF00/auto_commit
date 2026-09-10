@@ -242,6 +242,31 @@ class AutoCommitWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(auto_commit.AutoCommitError, "未分类"):
             auto_commit.validate_plan(result, {"app.py", "README.md"})
 
+    def test_execute_once_retries_incomplete_codex_classification(self):
+        repo, _ = self.make_repo(with_remote=False)
+        (repo / "app.py").write_text("print('backup')\n", encoding="utf-8")
+        incomplete = commit_result(included=[])
+        incomplete["clean"] = False
+        complete = commit_result(included=["app.py"])
+        analyze = mock.Mock(
+            side_effect=[
+                (repo.resolve(), incomplete),
+                (repo.resolve(), complete),
+            ]
+        )
+
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo, dry_run=True),
+            analyzer=analyze,
+        )
+
+        self.assertEqual(outcome.status, "dry-run")
+        self.assertEqual(analyze.call_count, 2)
+        first_kwargs = analyze.call_args_list[0].kwargs
+        retry_kwargs = analyze.call_args_list[1].kwargs
+        self.assertEqual(first_kwargs["required_paths"], ("app.py",))
+        self.assertIn("未分类：app.py", retry_kwargs["validation_feedback"])
+
     def test_plan_rejects_broad_ignore_pattern(self):
         result = commit_result(included=[], excluded=["cache.bin"])
         result["ignore_recommendations"][0]["gitignore_pattern"] = "*"

@@ -69,6 +69,16 @@ class CodexGitAdvisorTests(unittest.TestCase):
         self.assertIn("敏感文件", prompt)
         self.assertNotIn("--- BEGIN UNTRUSTED REPOSITORY DATA ---", prompt)
 
+    def test_direct_prompt_can_require_exact_changed_paths(self):
+        prompt = auto_commit.build_direct_prompt(
+            "zh",
+            required_paths=("README.md", "src/app.py"),
+            validation_feedback="未分类：src/app.py",
+        )
+        self.assertIn('["README.md", "src/app.py"]', prompt)
+        self.assertIn("未分类：src/app.py", prompt)
+        self.assertIn("不是仓库快照", prompt)
+
     def test_direct_prompt_uses_backup_first_classification(self):
         prompt = auto_commit.build_direct_prompt("zh")
         for path in ("README.md", "auto_commit.py", "test_auto_commit.py"):
@@ -108,7 +118,7 @@ class CodexGitAdvisorTests(unittest.TestCase):
                 self.assertEqual(command[command.index("--cd") + 1], str(repo))
                 self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
                 self.assertNotIn("--skip-git-repo-check", command)
-                self.assertNotIn("--json", command)
+                self.assertIn("--json", command)
                 self.assertIn("plugins", command)
                 self.assertIn("remote_plugin", command)
                 self.assertIn("browser_use", command)
@@ -167,6 +177,129 @@ class CodexGitAdvisorTests(unittest.TestCase):
                 )
 
         self.assertTrue(result["clean"])
+
+    def test_invoke_codex_timeout_reports_stage_progress_and_no_proven_cause(self):
+        events = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "git status --short",
+                            "exit_code": 0,
+                        },
+                    }
+                ),
+            ]
+        )
+        timeout_error = auto_commit.ProcessTimeoutError(
+            ["codex", "exec"], 300, events, ""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                auto_commit, "run_process", side_effect=timeout_error
+            ):
+                with self.assertRaises(auto_commit.AdvisorError) as raised:
+                    auto_commit.invoke_codex(
+                        auto_commit.build_direct_prompt("zh"),
+                        repo=Path(directory),
+                        codex_command="codex",
+                        model=None,
+                        timeout=300,
+                    )
+
+        message = str(raised.exception)
+        self.assertIn("Codex 仓库分析超时（300 秒）", message)
+        self.assertIn("尚未执行：修改 .gitignore", message)
+        self.assertIn("git status --short", message)
+        self.assertIn("无法确定是网络/API 故障还是任务分析耗时", message)
+
+    def test_invoke_codex_timeout_includes_explicit_codex_error(self):
+        event = json.dumps(
+            {"type": "error", "message": "connection reset by peer"}
+        )
+        timeout_error = auto_commit.ProcessTimeoutError(
+            ["codex", "exec"], 300, event, "ERROR retry exhausted"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                auto_commit, "run_process", side_effect=timeout_error
+            ):
+                with self.assertRaises(auto_commit.AdvisorError) as raised:
+                    auto_commit.invoke_codex(
+                        auto_commit.build_direct_prompt("zh"),
+                        repo=Path(directory),
+                        codex_command="codex",
+                        model=None,
+                        timeout=300,
+                    )
+
+        message = str(raised.exception)
+        self.assertIn("connection reset by peer", message)
+        self.assertIn("retry exhausted", message)
+        self.assertNotIn("无法确定是网络/API", message)
+
+    def test_invoke_codex_recovers_final_result_emitted_before_timeout(self):
+        payload = {
+            "clean": False,
+            "branch": "main",
+            "summary": "已完成仓库分析",
+            "ignore_recommendations": [],
+            "commit": {
+                "title": "更新自动提交工具",
+                "body": [],
+                "full_message": "更新自动提交工具",
+                "included_paths": ["auto_commit.py"],
+                "excluded_paths": [],
+                "manual_review_paths": [],
+            },
+            "cautions": [],
+        }
+        event = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": json.dumps(payload, ensure_ascii=False),
+                },
+            },
+            ensure_ascii=False,
+        )
+        timeout_error = auto_commit.ProcessTimeoutError(
+            ["codex", "exec"], 300, event, ""
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                auto_commit, "run_process", side_effect=timeout_error
+            ):
+                result = auto_commit.invoke_codex(
+                    auto_commit.build_direct_prompt("zh"),
+                    repo=Path(directory),
+                    codex_command="codex",
+                    model=None,
+                    timeout=300,
+                )
+
+        self.assertEqual(result, payload)
+
+    def test_timeout_warning_is_diagnostic_not_proven_error(self):
+        events = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.started"}),
+            ]
+        )
+        message = auto_commit._codex_timeout_details(
+            events,
+            "WARN shell snapshot: Failed to create shell snapshot for PowerShell",
+            1,
+        )
+        self.assertIn("未捕获到明确错误", message)
+        self.assertIn("可能仍在等待模型响应", message)
+        self.assertIn("原始诊断输出（可能仅包含警告）", message)
 
     def test_format_codex_command_event(self):
         line = json.dumps(

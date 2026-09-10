@@ -40,6 +40,10 @@ class AutoCommitError(RuntimeError):
     """An expected automation error that should be shown without a traceback."""
 
 
+class PlanCoverageError(AutoCommitError):
+    """Codex did not classify exactly the paths reported by Git."""
+
+
 @dataclass(frozen=True)
 class RunConfig:
     repo: Path
@@ -231,7 +235,7 @@ def _path_tuple(values: Any, field: str) -> tuple[str, ...]:
 
 def validate_plan(result: dict[str, Any], changed_paths: set[str]) -> CommitPlan:
     if result.get("clean") is not False:
-        raise AutoCommitError("工作区存在改动，但 Codex 错误地返回 clean=true")
+        raise PlanCoverageError("工作区存在改动，但 Codex 错误地返回 clean=true")
     commit = result.get("commit")
     if not isinstance(commit, dict):
         raise AutoCommitError("Codex 结果缺少 commit 对象")
@@ -252,7 +256,7 @@ def validate_plan(result: dict[str, Any], changed_paths: set[str]) -> CommitPlan
             details.append(f"未分类：{', '.join(missing)}")
         if extra:
             details.append(f"不存在的分类：{', '.join(extra)}")
-        raise AutoCommitError("Codex 没有准确覆盖当前改动；" + "；".join(details))
+        raise PlanCoverageError("Codex 没有准确覆盖当前改动；" + "；".join(details))
 
     recommendations = result.get("ignore_recommendations")
     if not isinstance(recommendations, list):
@@ -396,18 +400,38 @@ def execute_once(config: RunConfig, *, analyzer: Analyzer | None = None) -> RunO
             report = f"仓库：{repo}\n分支：{branch}\n摘要：工作区没有待提交改动。"
             return RunOutcome(repo, branch, status, report, pushed=pushed)
 
-        analyzed_repo, result = analyze(
-            repo,
-            codex_command=config.codex_command,
-            model=config.model,
-            timeout=config.timeout,
-            live=config.live,
-            language=config.language,
-        )
+        required_paths = tuple(sorted(changed_paths))
+
+        def run_analysis(validation_feedback: str = "") -> tuple[Path, dict[str, Any]]:
+            return analyze(
+                repo,
+                codex_command=config.codex_command,
+                model=config.model,
+                timeout=config.timeout,
+                live=config.live,
+                language=config.language,
+                required_paths=required_paths,
+                validation_feedback=validation_feedback,
+            )
+
+        analyzed_repo, result = run_analysis()
         if analyzed_repo.resolve() != repo.resolve():
             raise AutoCommitError("Codex 分析结果来自另一个仓库")
+        try:
+            plan = validate_plan(result, changed_paths)
+        except PlanCoverageError as first_error:
+            LOGGER.warning("Codex 分类未覆盖全部改动，正在自动重试一次：%s", first_error)
+            if config.live:
+                print(
+                    "[Codex] 分类结果未覆盖全部改动，正在重新分析...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            analyzed_repo, result = run_analysis(str(first_error))
+            if analyzed_repo.resolve() != repo.resolve():
+                raise AutoCommitError("Codex 重试分析结果来自另一个仓库")
+            plan = validate_plan(result, changed_paths)
         report = advisor.render_report(repo, result)
-        plan = validate_plan(result, changed_paths)
 
         validate_ignore_matches(
             plan.ignore_patterns,
@@ -826,7 +850,7 @@ def main(argv: list[str] | None = None) -> int:
             outcome = execute_and_notify(config, email_config)
             print(format_outcome(outcome))
             return 0
-        schedule = parse_schedule_times(args.times or ["23:30"])
+        schedule = parse_schedule_times(args.times or ["23:00"])
         run_scheduler(
             config,
             schedule,

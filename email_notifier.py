@@ -158,16 +158,19 @@ def build_message(config: EmailConfig, notification: TaskNotification) -> EmailM
     html_body = f"""<!doctype html>
 <html lang="zh-CN">
 <body style="margin:0;background:#f3f4f6;color:#202124;font-family:Arial,'Microsoft YaHei',sans-serif">
-  <div style="max-width:720px;margin:0 auto;padding:24px">
-    <div style="background:#ffffff;border:1px solid #dfe1e5;border-radius:8px;overflow:hidden">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f4f6">
+    <tr>
+      <td align="center" style="padding:24px 0">
+        <table role="presentation" width="94%" cellspacing="0" cellpadding="0" border="0" style="width:94%;max-width:none;background:#ffffff;border:1px solid #dfe1e5;border-radius:8px">
+          <tr><td style="padding:0">
       <div style="padding:18px 24px;background:{color};color:#ffffff">
         <div style="font-size:13px">Git 自动推送</div>
         <div style="font-size:22px;font-weight:700;margin-top:4px">{html.escape(state)}</div>
       </div>
       <div style="padding:22px 24px">
-        <table style="width:100%;border-collapse:collapse;font-size:14px">
-          <tr><th style="text-align:left;padding:6px 16px 6px 0">本地仓库</th><td>{html.escape(str(notification.repository))}</td></tr>
-          <tr><th style="text-align:left;padding:6px 16px 6px 0">远程仓库</th><td>{html.escape(remote_display)}</td></tr>
+        <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;table-layout:fixed">
+          <tr><th style="width:82px;text-align:left;padding:6px 16px 6px 0">本地仓库</th><td style="overflow-wrap:anywhere;word-break:break-all">{html.escape(str(notification.repository))}</td></tr>
+          <tr><th style="width:82px;text-align:left;padding:6px 16px 6px 0">远程仓库</th><td style="overflow-wrap:anywhere;word-break:break-all">{html.escape(remote_display)}</td></tr>
           <tr><th style="text-align:left;padding:6px 16px 6px 0">分支</th><td>{html.escape(notification.branch or '未知')}</td></tr>
           <tr><th style="text-align:left;padding:6px 16px 6px 0">时间</th><td>{html.escape(notification.occurred_at)}</td></tr>
           {commit_html}
@@ -175,10 +178,13 @@ def build_message(config: EmailConfig, notification: TaskNotification) -> EmailM
         </table>
         {ignore_html}
         <h2 style="font-size:16px;margin-top:22px">任务详情</h2>
-        <pre style="white-space:pre-wrap;word-break:break-word;background:#f8f9fa;border:1px solid #e8eaed;border-radius:6px;padding:14px;font-family:Consolas,monospace;font-size:13px">{html.escape(summary)}</pre>
+        <pre style="white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:#f8f9fa;border:1px solid #e8eaed;border-radius:6px;padding:14px;font-family:Consolas,monospace;font-size:13px">{html.escape(summary)}</pre>
       </div>
-    </div>
-  </div>
+          </td></tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>"""
     message.add_alternative(html_body, subtype="html")

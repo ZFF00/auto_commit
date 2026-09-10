@@ -224,7 +224,7 @@ python codex_git_advisor.py --json
 --no-push                   只提交到本地
 --dry-run                   只分析和验证
 --live                      实时显示 Codex 执行过程
---timeout SECONDS           Codex 超时，默认 300 秒
+--timeout SECONDS           Codex 仓库分析超时，默认 300 秒
 --codex PATH                Codex CLI 命令或完整路径
 --log-file PATH             同时记录运行日志
 --email                     要求启用邮件，最终配置不完整时立即报错
@@ -249,6 +249,10 @@ python -m py_compile auto_commit.py codex_git_advisor.py email_notifier.py test_
 ```
 
 测试使用临时工作仓库和本地裸远程仓库验证真实的 `.gitignore`、commit 与 push，不会访问项目配置的 GitHub 远程仓库。
+
+Codex 分析达到超时上限时，脚本会先尝试从最终消息或结果文件恢复已经生成的完整结构化结果；恢复成功便继续后续流程，不会因为缺少 `turn.completed` 收尾事件而误报失败。确实没有完整结果时，脚本才会报告超时，列出最后几条进度事件、明确错误以及警告/诊断输出。此时尚未修改 `.gitignore`，也没有执行暂存、提交或推送；外层流程仍可按邮件配置发送失败通知。如果 Codex 没有返回明确错误，脚本会说明无法仅凭超时区分网络/API 故障与正常分析耗时，而不会猜测原因。
+
+Python 会把 Git 已报告的待分类路径清单作为安全边界交给 Codex，但不发送文件内容或预先拼接的 diff。Codex 仍自行检查仓库；如果第一次结果遗漏或额外添加了路径，脚本会把具体校验错误反馈给 Codex并自动重试一次。第二次仍不完整时才停止任务。
 
 ## 数据与安全边界
 
