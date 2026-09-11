@@ -3,6 +3,7 @@ from email_notifier import (
     EmailConfig,
     EmailNotificationError,
     TaskNotification,
+    TaskStep,
     build_message,
     send_notification,
     should_send,
@@ -45,6 +46,58 @@ def notification(**overrides: object) -> TaskNotification:
 
 
 class EmailMessageTests(unittest.TestCase):
+    def test_pipeline_headers_follow_task_status(self):
+        for status, success, color in (("committed", True, "#246448"), ("failed", False, "#982e43"),
+                                        ("clean", True, "#4d5d72"), ("dry-run", True, "#265b91")):
+            with self.subTest(status=status):
+                message = build_message(email_config(), notification(status=status, success=success))
+                body = message.get_body(preferencelist=("html",)).get_content()
+                self.assertIn(f'bgcolor="{color}"', body)
+                self.assertNotIn("<script", body)
+                self.assertNotIn("<svg", body)
+                self.assertNotIn("display:flex", body)
+
+    def test_commit_title_body_hash_and_details_are_escaped(self):
+        message = build_message(email_config(), notification(
+            commit_message="feat: <标题>\n\n说明 & 内容\n第二行", commit_kind="created",
+            file_count=12, steps=(TaskStep("检查仓库", "已完成", "<detail>"),)))
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        body = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("feat: <标题>", plain)
+        self.assertIn("feat: &lt;标题&gt;", body)
+        self.assertIn("说明 &amp; 内容", body)
+        self.assertIn("第二行", body)
+        self.assertIn("&lt;detail&gt;", body)
+        self.assertIn("本次提交文件：12", plain)
+        self.assertIn("0123456789abcdef", body)
+
+    def test_dry_run_labels_proposed_commit_and_ignore_rules(self):
+        notice = notification(status="dry-run", commit_hash="", commit_message="拟提交标题\n说明",
+                              commit_kind="planned", pushed=False)
+        message = build_message(email_config(), notice)
+        for part in ("html", "plain"):
+            body = message.get_body(preferencelist=(part,)).get_content()
+            self.assertIn("拟提交信息 · 尚未创建", body)
+            self.assertIn("建议忽略规则", body)
+            self.assertNotIn("新增忽略规则", body)
+
+    def test_failure_and_local_only_headlines_do_not_claim_push_success(self):
+        notice = notification(success=False, status="failed", pushed=False, commit_kind="created",
+            steps=(TaskStep("推送远程", "失败", "连接失败"),))
+        failed = build_message(email_config(), notice).get_body(preferencelist=("html",)).get_content()
+        self.assertIn("提交已保存，推送待重试", failed)
+        local = build_message(email_config(), notification(pushed=False)).get_body(preferencelist=("html",)).get_content()
+        self.assertIn("改动已保存到本地", local)
+        self.assertNotIn("改动已安全送达", local)
+
+    def test_large_details_are_bounded(self):
+        message = build_message(email_config(), notification(summary="x" * 100_000,
+            ignore_patterns=tuple(f"cache{i}/" for i in range(1000))))
+        body = message.get_body(preferencelist=("html",)).get_content()
+        self.assertLess(len(body), 30_000)
+        self.assertIn("内容已截断", body)
+        self.assertIn("另有 970 条", body)
+
     def test_build_message_contains_plain_and_html_parts(self):
         message = build_message(
             email_config(),

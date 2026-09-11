@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Sequence
 
@@ -77,6 +77,49 @@ class RunOutcome:
     commit_hash: str = ""
     pushed: bool = False
     added_ignore_patterns: tuple[str, ...] = ()
+    commit_message: str = ""
+    commit_kind: str = ""
+    file_count: int | None = None
+    summary: str = ""
+    steps: tuple[email_notifier.TaskStep, ...] = ()
+
+
+@dataclass
+class _RunProgress:
+    repository: Path
+    branch: str
+    commit_hash: str = ""
+    commit_message: str = ""
+    commit_kind: str = ""
+    file_count: int | None = None
+    summary: str = ""
+    pushed: bool = False
+    patterns: tuple[str, ...] = ()
+    active: int = 0
+    steps: list[email_notifier.TaskStep] = field(default_factory=lambda: [
+        email_notifier.TaskStep(title, "未执行", "")
+        for title in ("检查仓库", "分析与筛选", "创建提交", "推送远程")
+    ])
+
+    def step(self, index: int, state: str, detail: str) -> None:
+        self.steps[index] = email_notifier.TaskStep(self.steps[index].title, state, detail)
+
+    def outcome(self, status: str, report: str) -> RunOutcome:
+        return RunOutcome(
+            self.repository, self.branch, status, report,
+            commit_hash=self.commit_hash, pushed=self.pushed,
+            added_ignore_patterns=self.patterns, commit_message=self.commit_message,
+            commit_kind=self.commit_kind, file_count=self.file_count,
+            summary=self.summary, steps=tuple(self.steps),
+        )
+
+
+class RunFailure(AutoCommitError):
+    """Keep completed work available to the failure notification."""
+
+    def __init__(self, error: Exception, outcome: RunOutcome) -> None:
+        super().__init__(str(error))
+        self.outcome = outcome
 
 
 Analyzer = Callable[..., tuple[Path, dict[str, Any]]]
@@ -384,22 +427,60 @@ def push_head(repo: Path, remote: str, branch: str) -> bool:
 
 def execute_once(config: RunConfig, *, analyzer: Analyzer | None = None) -> RunOutcome:
     """Analyze and perform one complete local commit/push cycle."""
+    progress = _RunProgress(config.repo.expanduser().resolve(), config.branch or "未知")
+    try:
+        return _execute_once(config, progress, analyzer=analyzer)
+    except Exception as exc:
+        progress.step(progress.active, "失败", "此阶段未完成，详见任务详情。")
+        progress.summary = advisor.redact_sensitive_output(str(exc))
+        raise RunFailure(exc, progress.outcome("failed", str(exc))) from exc
+
+
+def _read_commit(progress: _RunProgress, kind: str) -> None:
+    if has_head(progress.repository):
+        progress.commit_hash = run_git(progress.repository, "rev-parse", "HEAD").stdout.strip()
+        progress.commit_kind = kind
+        progress.commit_message = run_git(
+            progress.repository, "show", "-s", "--format=%B", progress.commit_hash
+        ).stdout.strip()
+
+
+def _finish_push(config: RunConfig, progress: _RunProgress) -> None:
+    progress.active = 3
+    if config.dry_run or not config.push:
+        progress.step(3, "未执行", "演练不推送远程仓库。" if config.dry_run else "本次配置为仅本地提交。")
+    else:
+        progress.pushed = push_head(progress.repository, config.remote, progress.branch)
+        progress.step(3, "已完成" if progress.pushed else "已跳过",
+                      f"HEAD 已成功推送到 {config.remote} / {progress.branch}。"
+                      if progress.pushed else "仓库尚无提交，无可推送的 HEAD。")
+
+
+def _execute_once(config: RunConfig, progress: _RunProgress, *, analyzer: Analyzer | None) -> RunOutcome:
     repo = advisor.find_repository(config.repo)
+    progress.repository = repo
     branch = current_branch(repo, config.branch)
+    progress.branch = branch
     if not config.dry_run:
         ensure_preconditions(repo, remote=config.remote, push=config.push)
     analyze = analyzer or advisor.analyze_repository
 
     with RepositoryLock(repo):
         changed_paths = list_changed_paths(repo)
+        progress.step(0, "已完成", f"识别到 {len(changed_paths)} 个变更路径。")
         if not changed_paths:
-            pushed = False
-            if config.push and not config.dry_run:
-                pushed = push_head(repo, config.remote, branch)
+            progress.file_count = 0
+            progress.summary = "工作区没有待提交改动。"
+            progress.step(1, "已跳过", "没有新改动，无需调用 Codex。")
+            progress.active = 2
+            _read_commit(progress, "head")
+            progress.step(2, "已跳过", "没有创建新提交。")
+            _finish_push(config, progress)
             status = "dry-run" if config.dry_run else "clean"
             report = f"仓库：{repo}\n分支：{branch}\n摘要：工作区没有待提交改动。"
-            return RunOutcome(repo, branch, status, report, pushed=pushed)
+            return progress.outcome(status, report)
 
+        progress.active = 1
         required_paths = tuple(sorted(changed_paths))
 
         def run_analysis(validation_feedback: str = "") -> tuple[Path, dict[str, Any]]:
@@ -446,7 +527,19 @@ def execute_once(config: RunConfig, *, analyzer: Analyzer | None = None) -> RunO
                 + ", ".join(sorted(unsafe_staged))
             )
         if config.dry_run:
-            return RunOutcome(repo, branch, "dry-run", report)
+            progress.commit_message = plan.commit_message
+            progress.commit_kind = "planned" if plan.commit_message else ""
+            progress.file_count = len(plan.included_paths)
+            progress.patterns = plan.ignore_patterns
+            review_count = len(plan.manual_review_paths)
+            blocking_count = sum(item.get("blocking") is True for item in plan.cautions)
+            progress.summary = f"演练预计包含 {progress.file_count} 个文件；人工确认 {review_count} 项，阻断风险 {blocking_count} 项。"
+            if review_count or blocking_count:
+                progress.summary += "\n" + "\n".join(str(item['reason']) for item in plan.cautions)
+            progress.step(1, "需确认" if review_count or blocking_count else "已完成", progress.summary)
+            progress.step(2, "未执行", "演练仅展示拟提交信息，未暂存或创建提交。")
+            _finish_push(config, progress)
+            return progress.outcome("dry-run", report)
 
         if plan.manual_review_paths:
             raise AutoCommitError(
@@ -464,7 +557,10 @@ def execute_once(config: RunConfig, *, analyzer: Analyzer | None = None) -> RunO
         if list_changed_paths(repo) != changed_paths:
             raise AutoCommitError("Codex 分析期间仓库内容发生变化，请重新执行")
 
+        progress.step(1, "已完成", f"分类与忽略规则校验通过，包含 {len(plan.included_paths)} 个文件。")
+        progress.active = 2
         added_patterns = update_gitignore(repo, plan.ignore_patterns)
+        progress.patterns = added_patterns
         paths_to_stage = list(plan.included_paths)
         if added_patterns and ".gitignore" not in paths_to_stage:
             paths_to_stage.append(".gitignore")
@@ -479,28 +575,22 @@ def execute_once(config: RunConfig, *, analyzer: Analyzer | None = None) -> RunO
                 + ", ".join(sorted(unexpected_staged))
             )
         if not staged_after:
-            pushed = push_head(repo, config.remote, branch) if config.push else False
-            return RunOutcome(
-                repo,
-                branch,
-                "clean",
-                report,
-                pushed=pushed,
-                added_ignore_patterns=added_patterns,
-            )
+            progress.file_count = 0
+            progress.summary = "校验后没有需要创建的新提交。"
+            _read_commit(progress, "head")
+            progress.step(2, "已跳过", "暂存区没有需要提交的改动。")
+            _finish_push(config, progress)
+            return progress.outcome("clean", report)
 
         run_git(repo, "commit", "--file=-", input_text=plan.commit_message + "\n")
-        commit_hash = run_git(repo, "rev-parse", "HEAD").stdout.strip()
-        pushed = push_head(repo, config.remote, branch) if config.push else False
-        return RunOutcome(
-            repo,
-            branch,
-            "committed",
-            report,
-            commit_hash=commit_hash,
-            pushed=pushed,
-            added_ignore_patterns=added_patterns,
-        )
+        _read_commit(progress, "created")
+        progress.file_count = len(_nul_paths(run_git(
+            repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", progress.commit_hash
+        ).stdout))
+        progress.step(2, "已完成", f"{progress.file_count} 个文件已保存为本地提交。")
+        progress.summary = f"已提交 {progress.file_count} 个文件，新增 {len(added_patterns)} 条忽略规则。"
+        _finish_push(config, progress)
+        return progress.outcome("committed", report)
 
 
 def parse_schedule_times(values: Sequence[str]) -> tuple[dt.time, ...]:
@@ -652,22 +742,28 @@ def _outcome_notification(
     outcome: RunOutcome, remote: str
 ) -> email_notifier.TaskNotification:
     return email_notifier.TaskNotification(
-        success=True,
+        success=outcome.status != "failed",
         status=outcome.status,
         repository=outcome.repository,
         branch=outcome.branch,
         occurred_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        summary=advisor.redact_sensitive_output(format_outcome(outcome)),
+        summary=advisor.redact_sensitive_output(outcome.summary or "本次任务已结束。"),
         remote_repository=_remote_repository(outcome.repository, remote),
         commit_hash=outcome.commit_hash,
         pushed=outcome.pushed,
         ignore_patterns=outcome.added_ignore_patterns,
+        commit_message=advisor.redact_sensitive_output(outcome.commit_message),
+        commit_kind=outcome.commit_kind,
+        file_count=outcome.file_count,
+        steps=tuple(replace(step, detail=advisor.redact_sensitive_output(step.detail)) for step in outcome.steps),
     )
 
 
 def _failure_notification(
     config: RunConfig, error: Exception
 ) -> email_notifier.TaskNotification:
+    if isinstance(error, RunFailure):
+        return _outcome_notification(error.outcome, config.remote)
     return email_notifier.TaskNotification(
         success=False,
         status="failed",

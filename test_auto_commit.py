@@ -70,6 +70,86 @@ def fake_analyzer(result: dict[str, object]):
 
 
 class AutoCommitWorkflowTests(unittest.TestCase):
+    def test_notification_uses_committed_message_and_count_without_file_list(self):
+        repo, _ = self.make_repo()
+        (repo / "private-path.py").write_text("print('ok')\n", encoding="utf-8")
+        result = commit_result(included=["private-path.py"])
+        result["commit"]["full_message"] = "feat: 邮件回执\n\n真实提交说明"
+        outcome = auto_commit.execute_once(auto_commit.RunConfig(repo), analyzer=fake_analyzer(result))
+        notice = auto_commit._outcome_notification(outcome, "origin")
+        self.assertEqual(notice.commit_message, git(repo, "show", "-s", "--format=%B").stdout.strip())
+        self.assertEqual(notice.file_count, 1)
+        self.assertEqual(notice.commit_kind, "created")
+        self.assertEqual([s.state for s in notice.steps], ["已完成"] * 4)
+        self.assertNotIn("private-path.py", notice.summary)
+        self.assertIn("private-path.py", outcome.report)
+
+    def test_push_failure_notification_retains_commit_and_stage(self):
+        repo, _ = self.make_repo(with_remote=False)
+        git(repo, "remote", "add", "origin", str(self.root / "missing.git"))
+        (repo / "app.py").write_text("print('ok')", encoding="utf-8")
+        config = auto_commit.RunConfig(repo)
+        with self.assertRaises(auto_commit.RunFailure) as caught:
+            auto_commit.execute_once(config, analyzer=fake_analyzer(commit_result(included=["app.py"])))
+        notice = auto_commit._failure_notification(config, caught.exception)
+        self.assertFalse(notice.success)
+        self.assertFalse(notice.pushed)
+        self.assertEqual(notice.commit_hash, git(repo, "rev-parse", "HEAD").stdout.strip())
+        self.assertIn("Back up reviewed files.", notice.commit_message)
+        self.assertEqual(notice.file_count, 1)
+        self.assertEqual([s.state for s in notice.steps], ["已完成", "已完成", "已完成", "失败"])
+
+    def test_analysis_failure_does_not_claim_old_commit_as_new(self):
+        repo, _ = self.make_repo()
+        (repo / "old.txt").write_text("old", encoding="utf-8")
+        git(repo, "add", ".")
+        git(repo, "commit", "-m", "existing")
+        (repo / "new.txt").write_text("new", encoding="utf-8")
+        config = auto_commit.RunConfig(repo)
+        with self.assertRaises(auto_commit.RunFailure) as caught:
+            auto_commit.execute_once(config, analyzer=mock.Mock(side_effect=RuntimeError("analysis failed")))
+        notice = auto_commit._failure_notification(config, caught.exception)
+        self.assertEqual(notice.commit_hash, "")
+        self.assertEqual([s.state for s in notice.steps], ["已完成", "失败", "未执行", "未执行"])
+
+    def test_dry_run_exposes_proposed_message_and_manual_review(self):
+        repo, _ = self.make_repo()
+        (repo / "app.py").write_text("print('ok')", encoding="utf-8")
+        (repo / "unknown.bin").write_bytes(b"?")
+        outcome = auto_commit.execute_once(auto_commit.RunConfig(repo, dry_run=True),
+            analyzer=fake_analyzer(commit_result(included=["app.py"], manual=["unknown.bin"])))
+        notice = auto_commit._outcome_notification(outcome, "origin")
+        self.assertEqual(notice.commit_kind, "planned")
+        self.assertEqual(notice.commit_hash, "")
+        self.assertEqual(notice.file_count, 1)
+        self.assertIn("人工确认 1 项", notice.summary)
+        self.assertEqual([s.state for s in notice.steps], ["已完成", "需确认", "未执行", "未执行"])
+        self.assertFalse(auto_commit.has_head(repo))
+
+    def test_clean_and_no_push_notifications_use_real_head(self):
+        repo, _ = self.make_repo()
+        (repo / "app.py").write_text("print('ok')", encoding="utf-8")
+        first = auto_commit.execute_once(auto_commit.RunConfig(repo, push=False),
+            analyzer=fake_analyzer(commit_result(included=["app.py"])))
+        self.assertEqual(first.steps[3].state, "未执行")
+        self.assertFalse(first.pushed)
+        for dry_run in (False, True):
+            clean = auto_commit.execute_once(auto_commit.RunConfig(repo, dry_run=dry_run))
+            self.assertEqual(clean.commit_hash, first.commit_hash)
+            self.assertEqual(clean.commit_message, first.commit_message)
+            self.assertEqual(clean.commit_kind, "head")
+            self.assertEqual(clean.file_count, 0)
+            self.assertEqual(clean.steps[1].state, "已跳过")
+            self.assertEqual(clean.steps[3].state, "未执行" if dry_run else "已完成")
+
+    def test_empty_repository_has_no_fabricated_commit(self):
+        repo, _ = self.make_repo()
+        outcome = auto_commit.execute_once(auto_commit.RunConfig(repo))
+        self.assertEqual(outcome.commit_hash, "")
+        self.assertEqual(outcome.commit_message, "")
+        self.assertEqual(outcome.steps[3].state, "已跳过")
+        self.assertFalse(outcome.pushed)
+
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)

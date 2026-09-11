@@ -70,6 +70,13 @@ class EmailConfig:
 
 
 @dataclass(frozen=True)
+class TaskStep:
+    title: str
+    state: str
+    detail: str
+
+
+@dataclass(frozen=True)
 class TaskNotification:
     success: bool
     status: str
@@ -81,6 +88,10 @@ class TaskNotification:
     commit_hash: str = ""
     pushed: bool = False
     ignore_patterns: tuple[str, ...] = ()
+    commit_message: str = ""
+    commit_kind: str = ""
+    file_count: int | None = None
+    steps: tuple[TaskStep, ...] = ()
 
 
 def _looks_like_email(value: str) -> bool:
@@ -108,6 +119,21 @@ def build_message(config: EmailConfig, notification: TaskNotification) -> EmailM
         _repository_label(notification.repository, remote_repository)
     )
     remote_display = remote_repository or "未配置或无法读取"
+    title, lead = _headline(notification)
+    commit_label = {"planned": "拟提交信息 · 尚未创建", "head": "当前 HEAD · 本次未新增提交",
+                    "created": "本次提交"}.get(notification.commit_kind, "提交信息")
+    if not notification.success and notification.commit_kind == "created":
+        commit_label = "本地提交 · 已保存"
+    commit_message = _truncate(notification.commit_message, 20_000)
+    commit_title, _, commit_body = commit_message.partition("\n")
+    ignore_label = "建议忽略规则" if notification.status == "dry-run" else "新增忽略规则"
+    ignore_text = "\n".join(notification.ignore_patterns[:30])
+    if len(notification.ignore_patterns) > 30:
+        ignore_text += f"\n另有 {len(notification.ignore_patterns) - 30} 条，详见运行报告。"
+    ignore_text = _truncate(ignore_text, 3000)
+    count_label = "预计包含文件" if notification.commit_kind == "planned" else "本次提交文件"
+    steps = notification.steps or tuple(TaskStep(name, "未记录", "没有可用的阶段记录。")
+        for name in ("检查仓库", "分析与筛选", "创建提交", "推送远程"))
     subject = f"[{state}] Git 自动推送：{repository_label}"
     sender_address = config.sender or config.username
     sender_header = (
@@ -125,11 +151,17 @@ def build_message(config: EmailConfig, notification: TaskNotification) -> EmailM
     ]
     if notification.commit_hash:
         lines.append(f"提交：{notification.commit_hash}")
+    if commit_message:
+        lines.extend(["", commit_label + "：", commit_message])
+    if notification.file_count is not None:
+        lines.append(f"{count_label}：{notification.file_count}")
     lines.append(f"推送：{'已完成' if notification.pushed else '未执行或未完成'}")
     if notification.ignore_patterns:
-        lines.extend(["", "新增 .gitignore 规则："])
-        lines.extend(f"- {pattern}" for pattern in notification.ignore_patterns)
-    summary = _truncate(notification.summary, 100_000)
+        lines.extend(["", ignore_label + "：", ignore_text])
+    lines.extend(["", "执行记录："])
+    for index, step in enumerate(steps, 1):
+        lines.append(f"{index}. {step.title} · {step.state}\n{_truncate(step.detail, 1000)}")
+    summary = _truncate(notification.summary, 4000)
     lines.extend(["", "任务详情：", summary])
 
     message = EmailMessage()
@@ -142,45 +174,66 @@ def build_message(config: EmailConfig, notification: TaskNotification) -> EmailM
     message["X-Auto-Response-Suppress"] = "All"
     message.set_content("\n".join(lines))
 
-    ignore_html = ""
-    if notification.ignore_patterns:
-        items = "".join(
-            f"<li><code>{html.escape(pattern)}</code></li>"
-            for pattern in notification.ignore_patterns
-        )
-        ignore_html = f"<h2>新增忽略规则</h2><ul>{items}</ul>"
+    wrap = "overflow-wrap:anywhere;word-break:break-all;"
+    table = 'role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0"'
+    metadata = [("本地仓库", str(notification.repository)), ("远程仓库", remote_display),
+                ("目标分支", notification.branch or "未知"), ("完成时间", notification.occurred_at)]
+    if notification.file_count is not None:
+        metadata.append((count_label, str(notification.file_count)))
+    metadata.append(("推送结果", "已完成" if notification.pushed else "未执行或未完成"))
+    metadata_html = "".join(
+        f'<tr><td width="76" style="width:76px;padding:10px 8px;vertical-align:top;color:#627084;border-bottom:1px solid #e0e6ed">{html.escape(label)}</td>'
+        f'<td style="padding:10px 8px;border-bottom:1px solid #e0e6ed;{wrap}">{html.escape(value)}</td></tr>'
+        for label, value in metadata
+    )
     commit_html = ""
-    if notification.commit_hash:
-        commit_html = (
-            "<tr><th>提交</th><td><code>"
-            f"{html.escape(notification.commit_hash)}</code></td></tr>"
-        )
+    if commit_message or notification.commit_hash:
+        hash_text = notification.commit_hash or ("未生成" if notification.commit_kind == "planned" else "未记录")
+        commit_html = f'''<table {table} style="table-layout:fixed;background:#f8fafc;border:1px solid #e0e6ed;border-radius:5px;margin-bottom:24px"><tr><td style="padding:16px;{wrap}">
+<div style="font-size:12px;color:#627084;margin-bottom:8px">{html.escape(commit_label)}</div>
+<div style="font-size:16px;font-weight:600;line-height:1.6">{html.escape(commit_title or '提交说明未记录')}</div>
+<div style="font-size:13px;line-height:1.9;white-space:pre-wrap;color:#627084;margin-top:8px">{html.escape(commit_body.strip())}</div>
+<div style="font-family:Consolas,monospace;font-size:12px;color:#627084;margin-top:12px;{wrap}">提交号：{html.escape(hash_text)}</div>
+</td></tr></table>'''
+    timeline_rows = []
+    for index, step in enumerate(steps, 1):
+        failed = step.state == "失败"
+        node_bg, node_ink = ("#fbe5e5", "#982e43") if failed else ("#e8eff5", "#345871")
+        # Table cells form the connector; no positioning, pseudo-elements, or icons.
+        detail = html.escape(_truncate(step.detail, 1000))
+        if index == 2 and ignore_text:
+            detail += f'<br><span style="color:#233044">{ignore_label}：</span><br>{html.escape(ignore_text).replace(chr(10), "<br>")}'
+        connector = "border-left:1px solid #dce3ec;" if index < len(steps) else ""
+        timeline_rows.append(f'''<tr>
+<td width="36" style="width:36px;vertical-align:top"><table role="presentation" width="26" cellspacing="0" cellpadding="0"><tr><td height="26" align="center" bgcolor="{node_bg}" style="height:26px;border-radius:13px;color:{node_ink};font-size:12px">{index}</td></tr></table></td>
+<td style="font-size:14px;font-weight:600;line-height:26px;{wrap}">{html.escape(step.title)} <span style="font-size:12px;font-weight:400;color:{'#982e43' if failed else '#627084'}">{html.escape(step.state)}</span></td></tr>
+<tr><td width="36" valign="top"><table role="presentation" width="26" height="100%" cellspacing="0" cellpadding="0"><tr><td width="12"></td><td style="{connector}">&nbsp;</td></tr></table></td>
+<td style="padding:3px 0 18px;font-size:13px;line-height:1.8;color:#627084;{wrap}">{detail}</td></tr>''')
+    timeline_html = "".join(timeline_rows)
     html_body = f"""<!doctype html>
 <html lang="zh-CN">
-<body style="margin:0;background:#f3f4f6;color:#202124;font-family:Arial,'Microsoft YaHei',sans-serif">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;background:#f2f4f7;color:#233044;font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.6">
   <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#f3f4f6">
     <tr>
       <td align="center" style="padding:24px 0">
-        <table role="presentation" width="94%" cellspacing="0" cellpadding="0" border="0" style="width:94%;max-width:none;background:#ffffff;border:1px solid #dfe1e5;border-radius:8px">
-          <tr><td style="padding:0">
-      <div style="padding:18px 24px;background:{color};color:#ffffff">
-        <div style="font-size:13px">Git 自动推送</div>
-        <div style="font-size:22px;font-weight:700;margin-top:4px">{html.escape(state)}</div>
-      </div>
-      <div style="padding:22px 24px">
-        <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;table-layout:fixed">
-          <tr><th style="width:82px;text-align:left;padding:6px 16px 6px 0">本地仓库</th><td style="overflow-wrap:anywhere;word-break:break-all">{html.escape(str(notification.repository))}</td></tr>
-          <tr><th style="width:82px;text-align:left;padding:6px 16px 6px 0">远程仓库</th><td style="overflow-wrap:anywhere;word-break:break-all">{html.escape(remote_display)}</td></tr>
-          <tr><th style="text-align:left;padding:6px 16px 6px 0">分支</th><td>{html.escape(notification.branch or '未知')}</td></tr>
-          <tr><th style="text-align:left;padding:6px 16px 6px 0">时间</th><td>{html.escape(notification.occurred_at)}</td></tr>
-          {commit_html}
-          <tr><th style="text-align:left;padding:6px 16px 6px 0">推送</th><td>{'已完成' if notification.pushed else '未执行或未完成'}</td></tr>
-        </table>
-        {ignore_html}
-        <h2 style="font-size:16px;margin-top:22px">任务详情</h2>
-        <pre style="white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;background:#f8f9fa;border:1px solid #e8eaed;border-radius:6px;padding:14px;font-family:Consolas,monospace;font-size:13px">{html.escape(summary)}</pre>
-      </div>
+        <table role="presentation" width="94%" cellspacing="0" cellpadding="0" border="0" style="width:94%;max-width:none;table-layout:fixed;background:#ffffff;border:1px solid #e0e6ed;border-radius:5px">
+          <tr><td bgcolor="{color}" style="padding:18px 20px;background:{color};color:#ffffff;{wrap}">
+            <div style="font-size:12px">Git 自动推送</div>
+            <div style="font-size:23px;font-weight:600;line-height:1.4;margin:6px 0">{html.escape(title)}</div>
+            <div style="font-size:13px">{html.escape(repository_label)}</div>
+            <div style="font-size:13px;margin-top:4px">{html.escape(lead)}</div>
+            <div style="font-size:12px;margin-top:10px">{html.escape(state)}</div>
           </td></tr>
+          <tr><td style="padding:22px 18px">
+            <table {table} style="table-layout:fixed;font-size:12px;border:1px solid #e0e6ed;border-radius:5px;margin-bottom:24px">{metadata_html}</table>
+            {commit_html}
+            <div style="font-size:12px;color:#627084;margin-bottom:14px">执行记录</div>
+            <table {table} style="table-layout:fixed">{timeline_html}</table>
+            <div style="border-top:1px solid #e0e6ed;margin-top:8px;padding-top:16px;font-size:13px">任务详情</div>
+            <div style="font-size:13px;line-height:1.8;white-space:pre-wrap;color:#627084;margin-top:6px;{wrap}">{html.escape(summary)}</div>
+          </td></tr>
+          <tr><td style="padding:14px 18px;border-top:1px solid #e0e6ed;background:#f8fafc;color:#627084;font-size:11px">Codex Git 自动推送 · 自动生成的任务通知</td></tr>
         </table>
       </td>
     </tr>
@@ -193,12 +246,26 @@ def build_message(config: EmailConfig, notification: TaskNotification) -> EmailM
 
 def _display_state(notification: TaskNotification) -> tuple[str, str]:
     if not notification.success:
-        return "任务失败", "#b3261e"
+        return "任务失败", "#982e43"
     if notification.status == "committed":
-        return "提交成功", "#137333"
+        return "提交成功", "#246448"
     if notification.status == "dry-run":
-        return "演练完成", "#1967d2"
-    return "仓库无变化", "#5f6368"
+        return "演练完成", "#265b91"
+    return "仓库无变化", "#4d5d72"
+
+
+def _headline(notification: TaskNotification) -> tuple[str, str]:
+    if not notification.success:
+        push_failed = any(s.title == "推送远程" and s.state == "失败" for s in notification.steps)
+        if push_failed and notification.commit_hash:
+            return "提交已保存，推送待重试", "本地提交仍然保留，远程推送未完成。"
+        return "任务未完成", "请查看执行记录与错误详情。"
+    if notification.status == "dry-run":
+        return "演练检查完成", "仅完成分析与校验，未创建或推送提交。"
+    if notification.status == "committed":
+        return ("改动已安全送达", "本地提交与远程推送均已完成。") if notification.pushed else (
+            "改动已保存到本地", "本地提交已完成，本次未推送远程。")
+    return "没有新增提交", "远程推送已完成。" if notification.pushed else "本次未推送远程。"
 
 
 def _repository_label(repository: Path, remote_repository: str) -> str:
