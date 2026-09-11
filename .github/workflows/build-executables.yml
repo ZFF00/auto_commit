@@ -4,15 +4,19 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - "*.py"
-      - ".github/workflows/build-executables.yml"
+    tags: ["v*"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-executables-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,6 +34,39 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Configure build version
+        id: version
+        shell: python
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          BUILD_REF: ${{ github.ref }}
+        run: |
+          import ast
+          import os
+          from pathlib import Path
+
+          path = Path("auto_commit.py")
+          source = path.read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          assignment = next(
+              node
+              for node in tree.body
+              if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets)
+          )
+          version = ast.literal_eval(assignment.value)
+          expected = f"v{version}"
+          if os.environ["BUILD_REF"].startswith("refs/tags/") and os.environ["RELEASE_TAG"] != expected:
+              raise SystemExit(f"Release tag must match auto_commit.py VERSION: {expected}")
+          if os.environ["BUILD_REF"] == "refs/heads/main":
+              separator = "." if "+" in version else "+"
+              version += f"{separator}build.{os.environ['GITHUB_RUN_NUMBER']}.{os.environ['GITHUB_RUN_ATTEMPT']}"
+              lines = source.splitlines(keepends=True)
+              lines[assignment.lineno - 1:assignment.end_lineno] = [f"VERSION = {version!r}\n"]
+              path.write_text("".join(lines), encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
 
       - name: Install builder
         run: python -m pip install --disable-pip-version-check pyinstaller==6.15.0
@@ -67,10 +104,66 @@ jobs:
             "dist/${{ matrix.executable }}" --help >/dev/null
           fi
 
+      - name: Record build provenance
+        shell: python
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("dist") / os.environ["EXECUTABLE"]
+          manifest = {
+              "sha": os.environ["GITHUB_SHA"],
+              "version": os.environ["BUILD_VERSION"],
+              "build_id": f"{os.environ['GITHUB_RUN_ID']}.{os.environ['GITHUB_RUN_ATTEMPT']}",
+              "file": path.name,
+              "size": path.stat().st_size,
+              "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+          }
+          Path("dist/build-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.executable }}
+          path: |
+            dist/${{ matrix.executable }}
+            dist/build-manifest.json
           if-no-files-found: error
           compression-level: 9
           retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    concurrency:
+      group: publish-github-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Verify and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_SHA: ${{ github.sha }}
+          BUILD_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_MODE: ${{ github.ref == 'refs/heads/main' && 'latest' || 'tag' }}
+        run: python publish_release.py --mode "$RELEASE_MODE"

@@ -20,7 +20,7 @@ import codex_git_advisor as advisor
 import email_notifier
 
 
-VERSION = "3.0.0"
+VERSION = "1.0.0"
 LOGGER = logging.getLogger("auto_commit")
 
 __all__ = [
@@ -53,7 +53,7 @@ class RunConfig:
     dry_run: bool = False
     codex_command: str = "codex"
     model: str | None = None
-    timeout: int = 300
+    timeout: int = advisor.DEFAULT_ANALYSIS_TIMEOUT
     live: bool = False
     language: str = "zh"
 
@@ -860,7 +860,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-m", "--model", help="可选的 Codex 模型名称")
     parser.add_argument("--language", choices=("zh", "en"), default="zh")
     parser.add_argument("--live", action="store_true", help="实时显示 Codex 执行过程")
-    parser.add_argument("--timeout", type=int, default=300, help="Codex 超时秒数")
+    parser.add_argument("--timeout", type=int, default=advisor.DEFAULT_ANALYSIS_TIMEOUT,
+                        help="每次 Codex 分析的超时秒数（默认 1800，30 分钟）")
     parser.add_argument("--log-file", type=Path, help="同时写入日志文件")
     email_group = parser.add_mutually_exclusive_group()
     email_group.add_argument(

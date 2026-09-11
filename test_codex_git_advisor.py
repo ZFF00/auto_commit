@@ -301,6 +301,17 @@ class CodexGitAdvisorTests(unittest.TestCase):
         self.assertIn("可能仍在等待模型响应", message)
         self.assertIn("原始诊断输出（可能仅包含警告）", message)
 
+    def test_unstable_feature_warning_is_not_mistaken_for_auth_error(self):
+        warning = (
+            'Under-development features enabled: default_mode_request_user_input. '
+            'To suppress this warning, set suppress_unstable_features_warning = true '
+            'in C:\\Users\\PC-0312\\.codex\\config.toml.'
+        )
+        message = auto_commit._codex_timeout_details('', warning, 1800)
+        self.assertIn('未捕获到明确错误', message)
+        self.assertIn('--timeout 3600', message)
+        self.assertIn(warning, message)
+
     def test_format_codex_command_event(self):
         line = json.dumps(
             {

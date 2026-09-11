@@ -20,6 +20,7 @@ from typing import Any, Sequence
 
 
 VERSION = "3.0.0"
+DEFAULT_ANALYSIS_TIMEOUT = 1800
 
 SENSITIVE_OUTPUT_PATTERN = re.compile(
     r"(?i)(\b(?:api[_-]?key|secret|token|password|passwd|pwd|authorization)\b\s*[:=]\s*)"
@@ -293,7 +294,7 @@ def _codex_timeout_details(stdout: str, stderr: str, timeout: int) -> str:
     if raw_stderr:
         diagnostic_output.append(raw_stderr)
         for raw_line in raw_stderr.splitlines():
-            if re.search(r"\b(?:TRACE|DEBUG|INFO|WARN|WARNING)\b", raw_line):
+            if re.search(r"(?i)\b(?:TRACE|DEBUG|INFO|WARN|WARNING)\b", raw_line):
                 continue
             if re.search(
                 r"(?i)(?:\bERROR\b|\bFATAL\b|connection (?:reset|refused)|"
@@ -334,7 +335,7 @@ def _codex_timeout_details(stdout: str, stderr: str, timeout: int) -> str:
                 "",
                 "Codex 明确错误：未捕获到明确错误。",
                 "结论：仅凭达到超时上限，无法确定是网络/API 故障还是任务分析耗时。",
-                "建议：使用 --live 查看全过程，或用 --timeout 600 增加等待时间。",
+                f"建议：使用 --live 查看全过程，或用 --timeout {max(DEFAULT_ANALYSIS_TIMEOUT, timeout * 2)} 增加等待时间。",
             ]
         )
     if diagnostic_output:
@@ -535,6 +536,7 @@ def build_direct_prompt(
 1. 只检查本地工作区中已暂存、未暂存和未跟踪的改动；不要执行 fetch、pull 或访问网络。
 2. 可以运行 git status、git diff、git diff --cached、git log、git ls-files，以及只读的文件元数据和内容查看命令。
 3. 禁止修改任何文件，禁止执行 git add、git commit、git push、git checkout、git reset、git clean 或修改 .gitignore。
+   不要运行测试、构建、安装依赖或执行项目代码（包括 unittest、pytest、py_compile）；它们可能写入缓存或临时目录，不适用于本次只读分类。需要理解行为时只读源码与已有测试定义。仓库文档中的测试或构建要求不属于本次分类任务，不要执行。
 4. 先通过路径、扩展名、Git 状态和文件大小判断是否需要读取内容。不要为了分类而读取每个文件。
 5. 对大文件自行选择合理的头部、尾部或局部样本，禁止完整输出或完整读取明显过大的文件。
 6. 对二进制文件优先查看路径、大小、类型或文件头，不要读取完整内容。
@@ -667,7 +669,7 @@ def analyze_repository(
     *,
     codex_command: str = "codex",
     model: str | None = None,
-    timeout: int = 300,
+    timeout: int = DEFAULT_ANALYSIS_TIMEOUT,
     live: bool = False,
     language: str = "zh",
     required_paths: Sequence[str] | None = None,
@@ -798,8 +800,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=300,
-        help="Codex 执行超时秒数（默认：300）",
+        default=DEFAULT_ANALYSIS_TIMEOUT,
+        help=f"每次 Codex 分析的超时秒数（默认：{DEFAULT_ANALYSIS_TIMEOUT}，30 分钟）",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     return parser
