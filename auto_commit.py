@@ -869,7 +869,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="调用本机 Codex 审查改动，自动更新 .gitignore、提交并推送。"
     )
-    parser.add_argument("-r", "--repo", type=Path, default=Path.cwd(), help="Git 仓库路径")
+    parser.add_argument("-r", "--repo", type=Path, default=Path.cwd(),
+                        help="本地 Git 仓库路径（默认当前工作目录，含空格时请加引号）")
     parser.add_argument("--once", action="store_true", help="立即执行一次后退出")
     parser.add_argument(
         "-t",
