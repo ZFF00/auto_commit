@@ -21,6 +21,7 @@ import email_notifier
 
 
 VERSION = "1.0.0"
+DEFAULT_SCHEDULE_TIME = "23:30"
 LOGGER = logging.getLogger("auto_commit")
 
 __all__ = [
@@ -191,11 +192,16 @@ def _nul_paths(output: str) -> set[str]:
 
 
 def list_changed_paths(repo: Path) -> set[str]:
-    """Return staged, unstaged, deleted, and untracked non-ignored paths."""
+    """Return staged, unstaged, deleted, and untracked non-ignored paths.
+
+    Rename detection is disabled so a staged ``git mv`` reports both the old
+    and the new path; otherwise the deletion would be invisible to Codex's
+    required-path boundary and to the staged-path safety checks.
+    """
     changed: set[str] = set()
     for arguments in (
-        ("diff", "--name-only", "-z"),
-        ("diff", "--cached", "--name-only", "-z"),
+        ("diff", "--no-renames", "--name-only", "-z"),
+        ("diff", "--cached", "--no-renames", "--name-only", "-z"),
         ("ls-files", "--others", "--exclude-standard", "-z"),
     ):
         changed.update(_nul_paths(run_git(repo, *arguments).stdout))
@@ -203,12 +209,28 @@ def list_changed_paths(repo: Path) -> set[str]:
 
 
 def list_staged_paths(repo: Path) -> set[str]:
-    return _nul_paths(run_git(repo, "diff", "--cached", "--name-only", "-z").stdout)
+    return _nul_paths(
+        run_git(repo, "diff", "--cached", "--no-renames", "--name-only", "-z").stdout
+    )
 
 
 def stage_paths(repo: Path, paths: Sequence[str]) -> None:
-    if paths:
-        run_git(repo, "--literal-pathspecs", "add", "-A", "--", *paths)
+    """Stage exactly ``paths`` (additions, modifications, and deletions).
+
+    A deletion that is already staged (``git rm`` or the old side of ``git mv``)
+    no longer exists in the index or the worktree, so ``git add`` rejects its
+    pathspec. Such paths need no further action and are skipped rather than
+    handled with ``git rm --cached``.
+    """
+    if not paths:
+        return
+    already_staged = list_staged_paths(repo)
+    pending = [
+        path for path in paths
+        if os.path.lexists(repo / path) or path not in already_staged
+    ]
+    if pending:
+        run_git(repo, "--literal-pathspecs", "add", "-A", "--", *pending)
 
 
 def current_branch(repo: Path, requested: str | None) -> str:
@@ -585,7 +607,8 @@ def _execute_once(config: RunConfig, progress: _RunProgress, *, analyzer: Analyz
         run_git(repo, "commit", "--file=-", input_text=plan.commit_message + "\n")
         _read_commit(progress, "created")
         progress.file_count = len(_nul_paths(run_git(
-            repo, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", progress.commit_hash
+            repo, "diff-tree", "--root", "--no-commit-id", "--no-renames",
+            "--name-only", "-r", "-z", progress.commit_hash
         ).stdout))
         progress.step(2, "已完成", f"{progress.file_count} 个文件已保存为本地提交。")
         progress.summary = f"已提交 {progress.file_count} 个文件，新增 {len(added_patterns)} 条忽略规则。"
@@ -636,18 +659,20 @@ def format_outcome(outcome: RunOutcome) -> str:
     return "\n".join(lines).rstrip()
 
 
+KNOWN_SMTP_SETTINGS: dict[str, tuple[str, int, str]] = {
+    "qq.com": ("smtp.qq.com", 465, "ssl"),
+    "163.com": ("smtp.163.com", 465, "ssl"),
+    "126.com": ("smtp.126.com", 465, "ssl"),
+    "gmail.com": ("smtp.gmail.com", 465, "ssl"),
+    "outlook.com": ("smtp.office365.com", 587, "starttls"),
+    "hotmail.com": ("smtp.office365.com", 587, "starttls"),
+    "live.com": ("smtp.office365.com", 587, "starttls"),
+}
+
+
 def _default_smtp_settings(sender: str) -> tuple[str, int, str] | None:
-    domain = sender.rpartition("@")[2].lower()
-    known = {
-        "qq.com": ("smtp.qq.com", 465, "ssl"),
-        "163.com": ("smtp.163.com", 465, "ssl"),
-        "126.com": ("smtp.126.com", 465, "ssl"),
-        "gmail.com": ("smtp.gmail.com", 465, "ssl"),
-        "outlook.com": ("smtp.office365.com", 587, "starttls"),
-        "hotmail.com": ("smtp.office365.com", 587, "starttls"),
-        "live.com": ("smtp.office365.com", 587, "starttls"),
-    }
-    return known.get(domain)
+    """Return (host, port, security) for well-known mail providers."""
+    return KNOWN_SMTP_SETTINGS.get(sender.rpartition("@")[2].lower())
 
 
 def load_email_config(
@@ -821,8 +846,10 @@ def run_scheduler(
         LOGGER.info("开始自动提交任务：%s", started)
         try:
             outcome = execute_and_notify(config, email_config)
-        except Exception as exc:
+        except (AutoCommitError, advisor.AdvisorError) as exc:
             LOGGER.error("自动提交任务失败：%s", exc)
+        except Exception as exc:  # A bug rather than an expected failure: keep the traceback.
+            LOGGER.error("自动提交任务发生未预期错误：%s", exc, exc_info=True)
         else:
             print(format_outcome(outcome), flush=True)
             LOGGER.info("自动提交任务完成：%s", outcome.status)
@@ -849,7 +876,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--time",
         action="append",
         dest="times",
-        help="每日执行时间 HH:MM；可重复或用逗号分隔（默认 23:30）",
+        help=f"每日执行时间 HH:MM；可重复或用逗号分隔（默认 {DEFAULT_SCHEDULE_TIME}）",
     )
     parser.add_argument("--run-now", action="store_true", help="启动定时器时先立即执行一次")
     parser.add_argument("--remote", default="origin", help="推送的远程仓库名")
@@ -947,7 +974,7 @@ def main(argv: list[str] | None = None) -> int:
             outcome = execute_and_notify(config, email_config)
             print(format_outcome(outcome))
             return 0
-        schedule = parse_schedule_times(args.times or ["23:00"])
+        schedule = parse_schedule_times(args.times or [DEFAULT_SCHEDULE_TIME])
         run_scheduler(
             config,
             schedule,

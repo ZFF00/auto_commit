@@ -39,7 +39,7 @@ class EmailConfig:
     password: str
     security: EmailSecurity = "ssl"
     sender: str | None = None
-    sender_name: str = "Codex 自动推送"
+    sender_name: str = "Codex Git 推送"
     policy: EmailPolicy = "always"
     timeout: int = 30
 

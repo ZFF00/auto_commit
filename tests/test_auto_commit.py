@@ -201,6 +201,61 @@ class AutoCommitWorkflowTests(unittest.TestCase):
             git(remote, "rev-parse", "refs/heads/main").stdout.strip(),
         )
 
+    def test_staged_rename_exposes_both_paths_and_commits_completely(self):
+        repo, _ = self.make_repo()
+        (repo / "old_name.py").write_text("print('rename me')\n", encoding="utf-8")
+        git(repo, "add", "old_name.py")
+        git(repo, "commit", "-m", "init")
+        git(repo, "mv", "old_name.py", "new_name.py")
+
+        # Git's rename detection must not hide the deleted side from Codex.
+        self.assertEqual(
+            auto_commit.list_changed_paths(repo), {"old_name.py", "new_name.py"}
+        )
+
+        seen_required: list[tuple[str, ...]] = []
+
+        def analyze(repo_path: Path, **kwargs: object):
+            seen_required.append(tuple(kwargs["required_paths"]))  # type: ignore[arg-type]
+            return repo_path.resolve(), commit_result(
+                included=["new_name.py", "old_name.py"]
+            )
+
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo), analyzer=analyze
+        )
+
+        self.assertEqual(seen_required, [("new_name.py", "old_name.py")])
+        self.assertEqual(outcome.status, "committed")
+        self.assertEqual(outcome.file_count, 2)
+        committed = set(
+            git(repo, "show", "--pretty=format:", "--no-renames", "--name-only", "HEAD")
+            .stdout.splitlines()
+        )
+        self.assertEqual(committed, {"old_name.py", "new_name.py"})
+        self.assertEqual(git(repo, "status", "--short").stdout, "")
+
+    def test_staged_deletion_is_committed_without_git_rm_cached(self):
+        repo, _ = self.make_repo()
+        (repo / "obsolete.py").write_text("print('bye')\n", encoding="utf-8")
+        (repo / "kept.py").write_text("print('hi')\n", encoding="utf-8")
+        git(repo, "add", "obsolete.py", "kept.py")
+        git(repo, "commit", "-m", "init")
+        git(repo, "rm", "-q", "obsolete.py")
+        (repo / "kept.py").write_text("print('changed')\n", encoding="utf-8")
+
+        outcome = auto_commit.execute_once(
+            auto_commit.RunConfig(repo=repo),
+            analyzer=fake_analyzer(commit_result(included=["kept.py", "obsolete.py"])),
+        )
+
+        self.assertEqual(outcome.status, "committed")
+        self.assertEqual(outcome.file_count, 2)
+        self.assertNotIn(
+            "obsolete.py", git(repo, "ls-files").stdout.splitlines()
+        )
+        self.assertEqual(git(repo, "status", "--short").stdout, "")
+
     def test_clean_run_pushes_existing_unpushed_commit(self):
         repo, remote = self.make_repo()
         (repo / "note.txt").write_text("backup\n", encoding="utf-8")
@@ -559,6 +614,14 @@ class SchedulingTests(unittest.TestCase):
     def test_parse_schedule_times_rejects_invalid_time(self):
         with self.assertRaisesRegex(auto_commit.AutoCommitError, "无效的执行时间"):
             auto_commit.parse_schedule_times(["25:00"])
+
+    def test_default_schedule_time_matches_help_text(self):
+        self.assertEqual(
+            auto_commit.parse_schedule_times([auto_commit.DEFAULT_SCHEDULE_TIME]),
+            (dt.time(23, 30),),
+        )
+        help_text = auto_commit.build_parser().format_help()
+        self.assertIn(f"默认 {auto_commit.DEFAULT_SCHEDULE_TIME}", help_text)
 
     def test_next_run_time_uses_today_or_tomorrow(self):
         schedule = (dt.time(9, 0), dt.time(18, 0))

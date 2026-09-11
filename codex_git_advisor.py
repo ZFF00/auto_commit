@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-VERSION = "3.0.0"
+# Keep in step with auto_commit.VERSION (the release workflow reads that one).
+VERSION = "1.0.0"
 DEFAULT_ANALYSIS_TIMEOUT = 1800
 
 SENSITIVE_OUTPUT_PATTERN = re.compile(
@@ -58,6 +60,11 @@ class ProcessTimeoutError(AdvisorError):
         self.stderr = stderr
 
 
+def _process_group_options() -> dict[str, Any]:
+    """Popen options that let ``terminate_process_tree`` reach child processes."""
+    return {} if os.name == "nt" else {"start_new_session": True}
+
+
 def terminate_process_tree(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -67,7 +74,12 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
             capture_output=True,
             check=False,
         )
-    else:
+        return
+    try:
+        # Started with start_new_session=True, so the pid is the group id and
+        # helper commands spawned by Codex (git, cat, ...) are killed as well.
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
         process.kill()
 
 
@@ -169,6 +181,7 @@ def run_process(
             encoding="utf-8",
             errors="replace",
             env=environment,
+            **_process_group_options(),
         )
     except FileNotFoundError as exc:
         raise AdvisorError(f"找不到命令：{command[0]}") from exc
@@ -397,14 +410,20 @@ def run_process_live(
             errors="replace",
             env=environment,
             bufsize=1,
+            **_process_group_options(),
         )
     except FileNotFoundError as exc:
         raise AdvisorError(f"找不到命令：{command[0]}") from exc
 
     assert process.stdin is not None
     assert process.stdout is not None
-    process.stdin.write(input_text)
-    process.stdin.close()
+    try:
+        process.stdin.write(input_text)
+        process.stdin.close()
+    except (BrokenPipeError, OSError):
+        # Codex exited before reading the prompt; fall through so its real
+        # error output is captured and reported instead of a pipe traceback.
+        pass
 
     lines: queue.Queue[str | None] = queue.Queue()
 
@@ -547,7 +566,7 @@ def build_direct_prompt(
 11. 只有存在明确证据表明内容属于以下情况，才可归为 ignore 并列入 excluded_paths 和 ignore_recommendations：可再生成且没有独立信息价值的缓存或构建产物、临时日志、编辑器状态、密钥或本地私密配置、生成型二进制，或明显不适合 Git 且无需作为备份保存的大型数据。
 12. 不要仅因文件未跟踪、属于旧版本、与本次主要主题不同、建议拆分 commit、存在缺陷或测试失败而建议忽略。拆分提交和一般代码质量问题只能写入 cautions，不得改变 include/ignore 分类，并设置 blocking=false。
 13. 若大文件的价值、来源或可再生成性无法从只读检查中确认，将其归入 manual_review_paths 并在 cautions 中说明，不要仅凭体积直接归为 ignore。manual_review 只用于证据不足的情况。
-14. 本仓库中的具体分类基准：README.md、auto_commit.py、test_auto_commit.py 以及类似源码、测试和文档应默认 include；__pycache__/、nohup.out、确认属于编译或打包产物的无扩展名 auto_commit，以及明确无需备份的大型生成数据可 ignore。
+14. 本仓库中的具体分类基准：README.md、auto_commit.py、tests/test_auto_commit.py 以及类似源码、测试和文档应默认 include；__pycache__/、nohup.out、确认属于编译或打包产物的无扩展名 auto_commit，以及明确无需备份的大型生成数据可 ignore。
 15. included_paths 列出所有 include 路径；excluded_paths 必须与 ignore_recommendations 中的路径一致；manual_review_paths 列出所有需人工确认的路径。三组路径不得重叠。自动忽略必须有 high 置信度；不能达到 high 的内容应归入 manual_review_paths。
 16. 如果源码或文档中疑似嵌入真实密钥、Token、密码或其他会随提交泄露的凭据，不要忽略整个有价值文件；将该文件归入 manual_review_paths，并在 cautions 中设置 blocking=true，说明需要先移除和轮换凭据。绝不在命令输出、reason、summary、cautions 或其他结果中复述凭据原值。可能导致数据丢失、仓库损坏或错误发布的其他风险也设置 blocking=true。
 17. gitignore_pattern 必须尽量精确。tracked=true 时说明添加 .gitignore 不会自动取消跟踪。

@@ -12,6 +12,15 @@ import codex_git_advisor as auto_commit
 
 
 class CodexGitAdvisorTests(unittest.TestCase):
+    def test_version_matches_main_program_base_version(self):
+        import auto_commit as main_program
+
+        # CI appends "+build.N.M" to auto_commit.VERSION before running tests,
+        # so only the base version is compared.
+        self.assertEqual(
+            auto_commit.VERSION, main_program.VERSION.split("+", 1)[0]
+        )
+
     def test_resolve_explicit_codex_path(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "codex.cmd"
